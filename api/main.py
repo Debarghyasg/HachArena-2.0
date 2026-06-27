@@ -38,14 +38,20 @@ app.add_middleware(
 DB_URL     = os.getenv("DATABASE_URL", "postgresql://postgres:1221@localhost:5432/Netra")
 REDIS_URL  = os.getenv("REDIS_URL", "redis://localhost:6379")
 MODEL_PATH = os.getenv("MODEL_PATH", "./AI_Model/best_final.pt")
+# General-purpose COCO detector (80 common classes). Used as a FALLBACK so that
+# customer-uploaded refund photos — which the narrow retail model (product/barcode)
+# usually can't recognise — still produce a detection instead of always going to
+# manual review.
+GENERAL_MODEL_PATH = os.getenv("GENERAL_MODEL_PATH", "./AI_Model/yolov8n.pt")
 
 db_pool    = None
 redis_pool = None
 yolo_model = None   # loaded lazily in startup — never at module level
+general_model = None  # general COCO fallback detector
 
 @app.on_event("startup")
 async def startup():
-    global db_pool, redis_pool, yolo_model
+    global db_pool, redis_pool, yolo_model, general_model
 
     db_pool    = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
     redis_pool = await aioredis.from_url(REDIS_URL, decode_responses=True)
@@ -59,6 +65,13 @@ async def startup():
             print(f"✅ YOLOv8 model loaded from {MODEL_PATH}")
         else:
             print(f"⚠️  YOLO model not found at {MODEL_PATH} — running without visual verification")
+
+        # General COCO fallback detector (so arbitrary refund photos are still detected).
+        if os.path.exists(GENERAL_MODEL_PATH):
+            general_model = YOLO(GENERAL_MODEL_PATH)
+            print(f"✅ General fallback detector loaded from {GENERAL_MODEL_PATH}")
+        else:
+            print(f"ℹ️  General fallback detector not found at {GENERAL_MODEL_PATH} — refund photos rely on the retail model only")
     except Exception as e:
         print(f"⚠️  YOLO load failed ({e}) — running without visual verification")
 
@@ -194,20 +207,29 @@ def _decode_image(image_b64: str):
 
 
 def run_yolo_detailed(img) -> list[dict]:
-    """Run YOLO and return [{label, conf}, ...] sorted by confidence desc."""
-    if yolo_model is None or img is None:
+    """Run the retail detector; if it finds nothing, fall back to the general
+    COCO detector so arbitrary customer/refund photos still yield a detection.
+    Returns [{label, conf, model}, ...] sorted by confidence desc."""
+    if img is None:
         return []
-    try:
-        results = yolo_model(img, verbose=False)
-        dets = [
-            {"label": yolo_model.names[int(b.cls)], "conf": float(b.conf)}
-            for r in results
-            for b in r.boxes
-        ]
-        return sorted(dets, key=lambda d: d["conf"], reverse=True)
-    except Exception as e:
-        print(f"YOLO detailed inference error: {e}")
-        return []
+
+    def _run(model, tag):
+        if model is None:
+            return []
+        try:
+            results = model(img, verbose=False)
+            return [
+                {"label": model.names[int(b.cls)], "conf": float(b.conf), "model": tag}
+                for r in results for b in r.boxes
+            ]
+        except Exception as e:
+            print(f"YOLO detailed inference error ({tag}): {e}")
+            return []
+
+    dets = _run(yolo_model, "retail")
+    if not dets:                       # narrow model saw nothing → try the general one
+        dets = _run(general_model, "general")
+    return sorted(dets, key=lambda d: d["conf"], reverse=True)
 
 
 # Threshold above which the product/label is considered cleanly "intact" in
@@ -235,6 +257,7 @@ async def health():
             "db": "connected",
             "redis": "connected",
             "yolo": yolo_status,
+            "general_detector": "loaded" if general_model is not None else "not_loaded",
             "injection_lstm": "ready" if injection_model.is_ready() else "disabled",
         }
     except Exception as e:
@@ -455,7 +478,7 @@ def _analyze_intactness(img) -> dict:
         sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     except Exception:
         sharpness = 0.0
-    model_available = yolo_model is not None and bool(dets)
+    model_available = bool(dets)   # a detection from EITHER the retail or general model
     # intact is True/False only when the model actually located a product; when it
     # couldn't (model not loaded or nothing detected) it's None → "inconclusive",
     # NOT "damaged" (avoids mislabeling an unreadable photo as damaged).

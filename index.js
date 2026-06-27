@@ -56,6 +56,17 @@ sgMail.setApiKey(process.env.SENDGRID_API_KEY || '');
 const { createOtariClient } = require('./lib/otariClient');
 const otari = createOtariClient();
 
+// Surface the Otari gateway configuration at boot so Medium-tier misconfig is
+// obvious (a bare model name without OTARI_PROVIDER is the #1 cause of failures).
+if (otari.enabled) {
+    const resolved = otari.resolveModel();
+    console.log(`🛰️  Otari gateway ENABLED → ${otari.endpoint} | model=${resolved}` +
+        (resolved.includes('/') || resolved.includes(':') ? '' :
+            '  ⚠️ bare model name — set OTARI_PROVIDER (e.g. "openai") or a fully-qualified OTARI_MODEL like "openai/gpt-4o-mini"'));
+} else {
+    console.warn('🛰️  Otari gateway DISABLED (OTARI_BASE_URL not set) — Medium tier will fall back to human handoff.');
+}
+
 /**
  * Generate a human-readable fraud alert explanation via the Otari gateway.
  * Returns a plain-English summary the admin can quickly understand.
@@ -140,6 +151,20 @@ async function getCheckoutImage(transactionId) {
     return null;
 }
 
+// Retrieve the delivery photo saved for an ONLINE order (Delivery DB).
+async function getDeliveryImage(transactionId) {
+    try {
+        const r = await db.query(
+            `SELECT image_b64 FROM delivery_images WHERE transaction_id = $1 ORDER BY created_at DESC LIMIT 1`,
+            [transactionId]
+        );
+        if (r.rows.length > 0 && r.rows[0].image_b64) return { image_b64: r.rows[0].image_b64 };
+    } catch (err) {
+        if (!getDeliveryImage._warned) { console.warn('delivery_images read skipped:', err.message); getDeliveryImage._warned = true; }
+    }
+    return null;
+}
+
 // Stage-2 prompt-injection classifier — calls the self-hosted LSTM on FastAPI.
 // Fails OPEN (returns null) so a model/FastAPI hiccup never blocks the chatbot;
 // the Stage-1 regex filter still protects the system.
@@ -165,6 +190,7 @@ const auditor = createAuditor({
     logUsage,
     logInjection,
     getCheckoutImage,
+    getDeliveryImage,
 });
 
 // ── Grounded retrieval helpers for the general customer assistant ──────────────
@@ -1226,6 +1252,7 @@ app.post('/api/chatbot/audit', async (req, res) => {
             message: message.trim(),
             transactionId: transaction_id ?? null,
             imageB64: image_b64 || null,
+            channel: req.body?.channel || null,
         });
 
         // Persist the claim outcome for the manager dashboard / audit trail.
@@ -1270,6 +1297,7 @@ app.post('/api/chatbot/ask', async (req, res) => {
             message: message.trim(),
             transactionId: transaction_id ?? null,
             imageB64: image_b64 || null,
+            channel: req.body?.channel || null,
         });
 
         // Persist refund-claim outcomes (when the assistant delegated to the auditor).
@@ -1293,9 +1321,27 @@ app.post('/api/chatbot/ask', async (req, res) => {
     }
 });
 
+// GET /api/chatbot/otari-health — diagnose Medium-tier (Otari gateway) issues.
+// Performs a tiny live completion and reports the EXACT cause of any failure
+// (status + gateway response body), so "Medium not working" is debuggable.
+app.get('/api/chatbot/otari-health', async (req, res) => {
+    try {
+        const health = await otari.healthCheck();
+        const hint = !health.enabled
+            ? 'Set OTARI_BASE_URL (and OTARI_API_KEY) to enable the Medium tier.'
+            : health.ok
+                ? 'Medium tier is reachable and returning completions.'
+                : 'Medium tier call failed. Most common fixes: (1) use a fully-qualified model id ' +
+                  'like "openai/gpt-4o-mini" or set OTARI_PROVIDER; (2) check OTARI_API_KEY; ' +
+                  '(3) confirm the upstream provider key is configured inside the Otari gateway.';
+        res.status(health.ok || !health.enabled ? 200 : 502).json({ ...health, hint });
+    } catch (err) {
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
 // GET /api/chatbot/budget — live budget snapshot for the chat UI meter.
-app.get('/api/chatbot/budget', async (req, res) => {
-    const sessionId = budgetSessionId(req);
+app.get('/api/chatbot/budget', async (req, res) => {    const sessionId = budgetSessionId(req);
     const snap = await budgetEngine.snapshot(sessionId);
     res.json({ ...snap, tiers: aiConfig.TIERS });
 });

@@ -241,6 +241,28 @@ export default function ChatbotPage({ user }) {
                   ))}
                 </div>
               )}
+
+              {/* Channel + per-image seal/intactness findings (refund verification) */}
+              {m.role === 'bot' && m.verification && m.verification.channel && (
+                <div style={{ marginTop:6, display:'flex', flexWrap:'wrap', gap:5, alignItems:'center' }}>
+                  <span style={{ fontSize:9, fontWeight:700, padding:'2px 8px', borderRadius:20, color:'#22d3ee', border:'1px solid #22d3ee55', background:'#22d3ee14' }}>
+                    {m.verification.channel === 'online' ? '🚚 Online order' : '🏪 In-store purchase'}
+                  </span>
+                  {Array.isArray(m.verification.images) && m.verification.images.map((img, j) => {
+                    const label = img.source === 'delivery' ? 'Delivery DB' : (img.source === 'product' || img.source === 'checkout') ? 'Product DB' : img.source
+                    const ok = img.intact === true
+                    const bad = img.intact === false
+                    const color = ok ? '#34d399' : bad ? '#f87171' : '#94a3b8'
+                    const verdict = ok ? 'seal intact' : bad ? 'seal compromised' : 'inconclusive'
+                    return (
+                      <span key={j} title={img.top_label ? `detected: ${img.top_label} (${Math.round((img.top_conf||0)*100)}%)` : undefined}
+                        style={{ fontSize:8.5, fontFamily:'monospace', padding:'2px 7px', borderRadius:6, color, border:`1px solid ${color}44`, background:`${color}11` }}>
+                        {label}: {verdict}
+                      </span>
+                    )
+                  })}
+                </div>
+              )}
             </div>
           ))}
 

@@ -9,7 +9,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import asyncpg
 import os
 import cv2
@@ -91,12 +91,28 @@ class MatchRequest(BaseModel):
     image_b64:     Optional[str] = None   # base64 image — triggers YOLO inference
 
 
+class AuditImage(BaseModel):
+    """A single image to inspect, tagged with where it came from."""
+    source:    str                              # product | delivery | checkout
+    image_b64: str
+
+
 class AuditClaimRequest(BaseModel):
-    """High-tier visual verification of a post-purchase return claim."""
-    claim_type:         str                     # broken_label | damaged | wrong_size | wrong_item
-    checkout_image_b64: Optional[str] = None    # the live image saved at checkout
+    """High-tier visual verification of a post-purchase return claim.
+
+    Supports two purchase channels:
+      • offline → only the product image captured at in-store checkout is checked.
+      • online  → the product image (at dispatch) AND the delivery photo are
+                  both checked, so a seal that was intact at sale but broken in
+                  transit can be detected.
+    """
+    claim_type:         str                          # broken_label | damaged | seal | wrong_size | wrong_item
+    channel:            Optional[str] = "offline"    # offline | online
+    checkout_image_b64: Optional[str] = None         # product image at checkout/dispatch (a.k.a. Customer DB)
+    delivery_image_b64: Optional[str] = None         # delivery photo (Delivery DB) — online only
+    images:             Optional[List[AuditImage]] = None  # generic multi-image alternative
     transaction_id:     Optional[str] = None
-    reference_label:    Optional[str] = None    # expected product (from inventory)
+    reference_label:    Optional[str] = None         # expected product (from inventory)
 
 
 class InjectionCheckRequest(BaseModel):
@@ -420,114 +436,197 @@ async def get_audit_log(shop_id: int, limit: int = 100):
 
 
 # ── POST /audit/verify-claim — HIGH-TIER post-purchase visual verification ────
-@app.post("/audit/verify-claim")
-async def verify_claim(req: AuditClaimRequest):
+def _analyze_intactness(img) -> dict:
     """
-    The Conversational Auditor's High-tier vision step. Examines the live image
-    captured at checkout to decide whether the customer's return claim (e.g.
-    "the label was broken") is supported by the visual evidence at purchase time.
+    Assess whether a product/seal looks INTACT in one image.
 
-    Returns:
-      claim_supported : True  → evidence supports the claim (refund possible)
-                        False → evidence contradicts the claim (item looked intact)
-                        None  → inconclusive → route to manual review
-      confidence      : 0.0–1.0 confidence in the verdict
-      finding         : human-readable explanation
-
-    NOTE: This uses the available YOLO detector as the visual reasoning model.
-    Detection confidence on the product/label is used as an "intactness" proxy —
-    a clean, high-confidence detection implies the label was intact at checkout,
-    so a "broken label" claim is contradicted. A production deployment would swap
-    in a fine-tuned label-integrity / damage-classification model behind this
-    same contract.
+    We don't ship a dedicated seal-tamper model, so detection confidence + image
+    sharpness are used as an intactness proxy: a clean, high-confidence, sharp
+    detection implies the product/seal was intact; a poorly-resolved/occluded/
+    blurry detection is consistent with damage or a broken seal. A production
+    deployment would swap a fine-tuned seal-integrity model behind this contract.
     """
-    if not req.checkout_image_b64:
-        return {"claim_supported": None, "confidence": 0.0,
-                "finding": "No checkout image available to verify the claim."}
-
-    try:
-        img = _decode_image(req.checkout_image_b64)
-    except Exception as e:
-        return {"claim_supported": None, "confidence": 0.0,
-                "finding": f"Checkout image could not be decoded ({e})."}
-
-    if img is None:
-        return {"claim_supported": None, "confidence": 0.0,
-                "finding": "Checkout image could not be decoded."}
-
-    dets = run_yolo_detailed(img)
-    top_conf = dets[0]["conf"] if dets else 0.0
+    dets      = run_yolo_detailed(img) if img is not None else []
+    top_conf  = dets[0]["conf"]  if dets else 0.0
     top_label = dets[0]["label"] if dets else None
-
-    # Sharpness as a secondary occlusion/damage cue (variance of Laplacian).
     try:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray      = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     except Exception:
         sharpness = 0.0
+    model_available = yolo_model is not None and bool(dets)
+    intact = bool(model_available and top_conf >= AUDIT_INTACT_THRESHOLD and sharpness >= 50.0)
+    return {
+        "top_label":       top_label,
+        "top_conf":        round(top_conf, 3),
+        "sharpness":       round(sharpness, 1),
+        "intact":          intact,
+        "model_available": model_available,
+        "detections":      dets[:5],
+    }
 
-    claim = (req.claim_type or "damaged").lower()
 
-    if yolo_model is None or not dets:
-        # Without a working detector we cannot assert intact-ness either way.
-        return {
-            "claim_supported": None,
-            "confidence": 0.2,
-            "finding": "Visual model could not confidently locate the product/label "
-                       "in the checkout image — manual review recommended.",
-            "top_label": top_label,
-            "detections": dets[:5],
-        }
+def _collect_images(req: "AuditClaimRequest") -> list[dict]:
+    """Build an ordered list of {source, image_b64} from the request, supporting
+    both the explicit `images` array and the legacy checkout/delivery fields."""
+    out = []
+    seen = set()
 
-    if claim in ("broken_label", "damaged"):
-        intact = top_conf >= AUDIT_INTACT_THRESHOLD and sharpness >= 50.0
-        if intact:
-            # Product/label cleanly visible at checkout → claim contradicted.
-            return {
-                "claim_supported": False,
-                "confidence": round(min(0.99, top_conf), 2),
-                "finding": f"At checkout the product/label was clearly visible "
-                           f"({top_label}, {round(top_conf*100)}% detection) — it appears intact, "
-                           f"contradicting the '{claim}' claim.",
-                "top_label": top_label,
-                "detections": dets[:5],
-            }
-        else:
-            # Low-confidence/occluded detection → damage claim is plausible.
-            return {
-                "claim_supported": True,
-                "confidence": round(min(0.95, 1.0 - top_conf + 0.2), 2),
-                "finding": f"The product/label was poorly resolved at checkout "
-                           f"(detection {round(top_conf*100)}%, sharpness {round(sharpness)}), "
-                           f"consistent with a '{claim}' condition.",
-                "top_label": top_label,
-                "detections": dets[:5],
-            }
+    def add(source, b64):
+        if b64 and source not in seen:
+            out.append({"source": source, "image_b64": b64})
+            seen.add(source)
 
+    if req.images:
+        for im in req.images:
+            add((im.source or "product").lower(), im.image_b64)
+    add("product", req.checkout_image_b64)
+    if (req.channel or "offline").lower() == "online":
+        add("delivery", req.delivery_image_b64)
+    return out
+
+
+@app.post("/audit/verify-claim")
+async def verify_claim(req: AuditClaimRequest):
+    """
+    The Conversational Auditor's High-tier vision step.
+
+    Scenario 1 (offline / in-store): inspect the product image captured at
+    checkout (Customer DB) and decide whether the seal/product was intact at
+    purchase — contradicting or supporting a "broken item / broken seal" claim.
+
+    Scenario 2 (online): inspect BOTH the product image at dispatch (Customer DB)
+    and the delivery photo (Delivery DB). If the seal looked intact at dispatch
+    but compromised at delivery, the damage happened in transit and the claim is
+    supported; if intact in both, the claim is contradicted.
+
+    Returns:
+      claim_supported : True / False / None (inconclusive → manual review)
+      confidence      : 0.0–1.0
+      finding         : human-readable explanation
+      channel         : offline | online
+      images          : per-image findings [{source, intact, top_label, ...}]
+    """
+    channel = (req.channel or "offline").lower()
+    claim   = (req.claim_type or "damaged").lower()
+    imgs    = _collect_images(req)
+
+    if not imgs:
+        return {"claim_supported": None, "confidence": 0.0, "channel": channel,
+                "finding": "No images available to verify the claim.", "images": []}
+
+    # Decode + analyse each provided image.
+    analyses = []
+    for entry in imgs:
+        try:
+            img = _decode_image(entry["image_b64"])
+        except Exception as e:
+            analyses.append({"source": entry["source"], "error": f"decode failed ({e})",
+                             "intact": None, "model_available": False})
+            continue
+        if img is None:
+            analyses.append({"source": entry["source"], "error": "decode failed",
+                             "intact": None, "model_available": False})
+            continue
+        a = _analyze_intactness(img)
+        a["source"] = entry["source"]
+        analyses.append(a)
+
+    by_source = {a["source"]: a for a in analyses}
+    product  = by_source.get("product") or by_source.get("checkout")
+    delivery = by_source.get("delivery")
+
+    # ── wrong_item / wrong_size — compare detected vs expected label ──────────
     if claim in ("wrong_item", "wrong_size"):
-        if req.reference_label and top_label:
-            score = fuzz.token_set_ratio(req.reference_label.lower(), top_label.lower()) / 100
-            supported = score < 0.5   # detected item differs from expected → claim supported
-            return {
-                "claim_supported": bool(supported),
-                "confidence": round(abs(0.5 - score) * 2, 2),
-                "finding": f"Checkout image shows '{top_label}' vs expected "
-                           f"'{req.reference_label}' (match {round(score*100)}%).",
-                "top_label": top_label,
-                "detections": dets[:5],
-            }
-        return {
-            "claim_supported": None,
-            "confidence": 0.3,
-            "finding": "Size/item claims need the original reference product to compare — "
-                       "routed to manual review.",
-            "top_label": top_label,
-            "detections": dets[:5],
-        }
+        ref = req.reference_label
+        cand = product or (analyses[0] if analyses else None)
+        if ref and cand and cand.get("top_label"):
+            score = fuzz.token_set_ratio(ref.lower(), cand["top_label"].lower()) / 100
+            supported = score < 0.5
+            return {"claim_supported": bool(supported),
+                    "confidence": round(abs(0.5 - score) * 2, 2), "channel": channel,
+                    "finding": f"Image shows '{cand['top_label']}' vs expected '{ref}' "
+                               f"(match {round(score*100)}%).",
+                    "images": analyses}
+        return {"claim_supported": None, "confidence": 0.3, "channel": channel,
+                "finding": "Size/item claims need the original reference product to compare — "
+                           "routed to manual review.",
+                "images": analyses}
 
-    return {"claim_supported": None, "confidence": 0.2,
-            "finding": f"Unsupported claim type '{claim}' — manual review.",
-            "top_label": top_label, "detections": dets[:5]}
+    # ── broken / damaged / seal claims — intactness reasoning ─────────────────
+    # If we never got a usable detection from any image, we can't assert intactness.
+    if not any(a.get("model_available") for a in analyses):
+        return {"claim_supported": None, "confidence": 0.2, "channel": channel,
+                "finding": "The visual model could not confidently locate the product/seal in the "
+                           "provided image(s) — manual review recommended.",
+                "images": analyses}
+
+    if channel == "online":
+        # Need the product image at minimum; delivery photo strengthens the verdict.
+        if not product or not product.get("model_available"):
+            return {"claim_supported": None, "confidence": 0.25, "channel": channel,
+                    "finding": "Could not resolve the product image captured at dispatch — manual review.",
+                    "images": analyses}
+
+        if delivery is None or not delivery.get("model_available"):
+            # Fall back to product-only reasoning, but flag the missing delivery photo.
+            intact = product["intact"]
+            return {"claim_supported": (not intact),
+                    "confidence": round(min(0.9, product["top_conf"] if intact else 1.0 - product["top_conf"] + 0.2), 2),
+                    "channel": channel,
+                    "finding": ("No delivery photo was available, so only the dispatch image was checked. "
+                                + ("It appears intact at dispatch — a transit-damage claim can't be confirmed "
+                                   "from images alone, routing for review." if intact
+                                   else "The product/seal was poorly resolved at dispatch, consistent with the claim.")),
+                    "images": analyses,
+                    "note": "MISSING_DELIVERY_IMAGE"}
+
+        prod_intact = product["intact"]
+        deli_intact = delivery["intact"]
+        if prod_intact and not deli_intact:
+            return {"claim_supported": True,
+                    "confidence": round(min(0.95, 1.0 - delivery["top_conf"] + 0.25), 2),
+                    "channel": channel,
+                    "finding": f"Seal was intact at dispatch ({product['top_label']}, "
+                               f"{round(product['top_conf']*100)}%) but compromised in the delivery photo "
+                               f"(detection {round(delivery['top_conf']*100)}%, sharpness {round(delivery['sharpness'])}) "
+                               f"— consistent with damage in transit.",
+                    "images": analyses}
+        if not prod_intact:
+            return {"claim_supported": True,
+                    "confidence": round(min(0.9, 1.0 - product["top_conf"] + 0.2), 2),
+                    "channel": channel,
+                    "finding": "The product/seal was already poorly resolved in the dispatch image, "
+                               "consistent with the reported condition.",
+                    "images": analyses}
+        # both intact
+        return {"claim_supported": False,
+                "confidence": round(min(0.95, (product["top_conf"] + delivery["top_conf"]) / 2), 2),
+                "channel": channel,
+                "finding": f"Seal appears intact in BOTH the dispatch image "
+                           f"({round(product['top_conf']*100)}%) and the delivery photo "
+                           f"({round(delivery['top_conf']*100)}%) — the '{claim}' claim is not supported.",
+                "images": analyses}
+
+    # ── offline (in-store): single product image at checkout ──────────────────
+    cand = product or next((a for a in analyses if a.get("model_available")), None)
+    if cand is None:
+        return {"claim_supported": None, "confidence": 0.2, "channel": channel,
+                "finding": "No usable product image — manual review.", "images": analyses}
+
+    if cand["intact"]:
+        return {"claim_supported": False,
+                "confidence": round(min(0.99, cand["top_conf"]), 2), "channel": channel,
+                "finding": f"At checkout the product/seal was clearly visible "
+                           f"({cand['top_label']}, {round(cand['top_conf']*100)}% detection) and appears intact, "
+                           f"contradicting the '{claim}' claim.",
+                "images": analyses}
+    return {"claim_supported": True,
+            "confidence": round(min(0.95, 1.0 - cand["top_conf"] + 0.2), 2), "channel": channel,
+            "finding": f"The product/seal was poorly resolved at checkout "
+                       f"(detection {round(cand['top_conf']*100)}%, sharpness {round(cand['sharpness'])}), "
+                       f"consistent with a '{claim}' condition.",
+            "images": analyses}
 
 
 # ── Internal audit helper ──────────────────────────────────────────────────────

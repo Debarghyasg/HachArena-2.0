@@ -61,7 +61,27 @@ CREATE TABLE IF NOT EXISTS checkout_images (
     shop_id         INTEGER,
     barcode         TEXT,
     image_b64       TEXT        NOT NULL,        -- base64 (or data-URL) of the live frame
+    purchase_channel TEXT       NOT NULL DEFAULT 'offline',  -- offline (in-store) | online
     return_eligible_until TIMESTAMPTZ,            -- created_at + 30 days
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_checkout_images_txn ON checkout_images (transaction_id);
+
+-- Back-fill the column for installs that ran an earlier version of this migration.
+ALTER TABLE checkout_images ADD COLUMN IF NOT EXISTS purchase_channel TEXT NOT NULL DEFAULT 'offline';
+
+-- ── Delivery images (Delivery DB) — online orders only ────────────────────────
+-- For online purchases, the courier/last-mile photo captured at delivery. The
+-- auditor compares this against the product image captured at dispatch/checkout
+-- so it can tell whether a seal was intact at sale but broken in transit.
+CREATE TABLE IF NOT EXISTS delivery_images (
+    id              BIGSERIAL PRIMARY KEY,
+    transaction_id  TEXT        NOT NULL,
+    shop_id         INTEGER,
+    barcode         TEXT,
+    image_b64       TEXT        NOT NULL,        -- base64 (or data-URL) of the delivery photo
+    courier         TEXT,                         -- optional carrier / agent id
+    delivered_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_images_txn ON delivery_images (transaction_id);

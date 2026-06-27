@@ -40,6 +40,7 @@ const PRODUCTS = [
         channel:      'offline',
         barcode:      '8901030823437',
         mkId:         'MK-MILO-2024-A001',
+        price:        120.00,
         image:        path.join(SAMPLES, 'milo.jpg'),
         delivery:     null,
     },
@@ -50,6 +51,7 @@ const PRODUCTS = [
         channel:      'online',
         barcode:      '012345678905',
         mkId:         'MK-CLG-2024-P010',
+        price:        65.00,
         image:        path.join(SAMPLES, 'colgate.jpg'),
         delivery:     path.join(SAMPLES, 'delivery_photo.jpg'),
     },
@@ -107,15 +109,45 @@ function toDataUrl(file) {
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             CREATE INDEX IF NOT EXISTS idx_delivery_images_txn ON delivery_images (transaction_id);
+
+            CREATE TABLE IF NOT EXISTS transaction_items (
+                id BIGSERIAL PRIMARY KEY,
+                transaction_id TEXT NOT NULL,
+                session_id TEXT,
+                user_id TEXT,
+                shop_id INTEGER,
+                barcode TEXT,
+                mk_id TEXT,
+                product_name TEXT,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                price NUMERIC,
+                purchase_channel TEXT NOT NULL DEFAULT 'offline',
+                return_eligible_until TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_transaction_items_txn     ON transaction_items (transaction_id);
+            CREATE INDEX IF NOT EXISTS idx_transaction_items_mkid    ON transaction_items (mk_id);
+            CREATE INDEX IF NOT EXISTS idx_transaction_items_barcode ON transaction_items (barcode);
         `);
 
         const txnIds = PRODUCTS.map(p => p.transaction);
 
         // Idempotent: clear any previous demo rows for these IDs.
-        await db.query(`DELETE FROM checkout_images WHERE transaction_id = ANY($1)`, [txnIds]);
-        await db.query(`DELETE FROM delivery_images WHERE transaction_id = ANY($1)`, [txnIds]);
+        await db.query(`DELETE FROM checkout_images   WHERE transaction_id = ANY($1)`, [txnIds]);
+        await db.query(`DELETE FROM delivery_images   WHERE transaction_id = ANY($1)`, [txnIds]);
+        await db.query(`DELETE FROM transaction_items WHERE transaction_id = ANY($1)`, [txnIds]);
 
         for (const p of PRODUCTS) {
+            // Customer purchase ledger row (the always-present item record).
+            await db.query(
+                `INSERT INTO transaction_items
+                   (transaction_id, session_id, user_id, shop_id, barcode, mk_id, product_name,
+                    quantity, price, purchase_channel, return_eligible_until, created_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NOW() + ($11 || ' days')::interval, NOW())`,
+                [p.transaction, `DEMO_SESSION_${p.label}`, `DEMO_${p.label}`, SHOP_ID, p.barcode,
+                 p.mkId, p.productName, 1, (p.price ?? null), p.channel, String(RETURN_DAYS)]
+            );
+
             // Product image + MK-ID link (Customer DB).
             await db.query(
                 `INSERT INTO checkout_images

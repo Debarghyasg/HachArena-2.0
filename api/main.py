@@ -618,29 +618,39 @@ async def refund_pickup(req: RefundPickupRequest):
         "message": None,
     }
 
-    # 1. Which MK-IDs / barcodes are linked to this transaction?
+    # 1. Which MK-IDs / barcodes / products are linked to this transaction?
+    #    Source = the customer purchase ledger (transaction_items) MERGED with any
+    #    stored checkout photos (checkout_images), so both real self-checkouts and
+    #    seeded/imaged demos resolve.
     txn_rows = []
     if db_pool is not None:
         try:
             async with db_pool.acquire() as conn:
+                # (a) canonical purchase ledger — may not exist pre-migration
                 try:
-                    rows = await conn.fetch(
-                        "SELECT mk_id, barcode FROM checkout_images WHERE transaction_id = $1 "
-                        "ORDER BY created_at DESC",
+                    ti = await conn.fetch(
+                        "SELECT mk_id, barcode, product_name FROM transaction_items "
+                        "WHERE transaction_id = $1 ORDER BY created_at DESC",
                         req.transaction_id,
                     )
-                except Exception as col_err:
-                    # The mk_id column may not exist yet (migration_refund_mkid.sql
-                    # not applied). Degrade to a barcode-only lookup so the flow
-                    # still works via the product catalogue (MOCK_DB serials).
-                    print(f"[refund-pickup] mk_id column unavailable, falling back to "
-                          f"barcode-only lookup: {col_err}")
-                    rows = await conn.fetch(
-                        "SELECT barcode FROM checkout_images WHERE transaction_id = $1 "
-                        "ORDER BY created_at DESC",
+                except Exception as ti_err:
+                    print(f"[refund-pickup] transaction_items unavailable: {ti_err}")
+                    ti = []
+                # (b) captured checkout photos (mk_id column may not exist pre-migration)
+                try:
+                    ci = await conn.fetch(
+                        "SELECT mk_id, barcode FROM checkout_images "
+                        "WHERE transaction_id = $1 ORDER BY created_at DESC",
                         req.transaction_id,
                     )
-            txn_rows = [dict(r) for r in rows]
+                except Exception as ci_err:
+                    print(f"[refund-pickup] checkout_images mk_id unavailable, barcode-only: {ci_err}")
+                    ci = await conn.fetch(
+                        "SELECT barcode FROM checkout_images "
+                        "WHERE transaction_id = $1 ORDER BY created_at DESC",
+                        req.transaction_id,
+                    )
+            txn_rows = [dict(r) for r in ti] + [dict(r) for r in ci]
         except Exception as e:
             print(f"[refund-pickup] transaction lookup failed: {e}")
             out["reason"] = "lookup_error"
@@ -656,6 +666,11 @@ async def refund_pickup(req: RefundPickupRequest):
 
     txn_mk_ids   = {(r["mk_id"] or "").upper() for r in txn_rows if r.get("mk_id")}
     txn_barcodes = {r["barcode"] for r in txn_rows if r.get("barcode")}
+    # Real product names sold under this transaction (from the ledger), keyed by barcode.
+    txn_names = {}
+    for r in txn_rows:
+        if r.get("barcode") and r.get("product_name"):
+            txn_names.setdefault(r["barcode"], r["product_name"])
 
     # 2. Recognise the product, and prepare to inspect the photo for damage.
     #    The photo is used for BOTH: (a) OCR'ing the MK-ID (unless one was
@@ -739,7 +754,9 @@ async def refund_pickup(req: RefundPickupRequest):
                 out["reason"] = "not_in_user_history"
 
     product      = MOCK_DB.get(matched_barcode) if matched_barcode else None
-    product_name = (product["product_name"] if product else None) or req.product_name
+    product_name = (txn_names.get(matched_barcode)
+                    or (product["product_name"] if product else None)
+                    or req.product_name)
     out["product_name"] = product_name
     out["barcode"]      = matched_barcode
     identifier = mk_id or barcode

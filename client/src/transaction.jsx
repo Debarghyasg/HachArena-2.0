@@ -144,15 +144,15 @@ function ScanCapture({ onVerified, scanning, setScanning }) {
       if (res.status === 409) {
         // Duplicate UID — already scanned in this session
         const dupData = await res.json().catch(() => ({}))
-        await onVerified(dupData, barcodeValue, productB64)
+        await onVerified(dupData, barcodeValue, productB64, null, mkIdValue)
       } else if (!res.ok) {
         throw new Error(`${res.status}`)
       } else {
         const data = await res.json()
-        await onVerified(data, barcodeValue, productB64)
+        await onVerified(data, barcodeValue, productB64, null, mkIdValue)
       }
     } catch (err) {
-      await onVerified(null, barcodeValue, productB64, err.message)
+      await onVerified(null, barcodeValue, productB64, err.message, mkIdValue)
     } finally {
       setProductB64(null); setBarcodeInput(''); setMkIdInput('')
       setStep('idle'); setScanning(false)
@@ -542,7 +542,7 @@ export default function TransactionPage({ user, setUser }) {
     setCart(prev => [{ ...item, id: uid(), qty: 1 }, ...prev])
   }
 
-  const handleVerified = useCallback(async (data, barcodeValue, productB64, errMsg) => {
+  const handleVerified = useCallback(async (data, barcodeValue, productB64, errMsg, mkIdValue) => {
     if (errMsg || !data) {
       // Check if the error is a duplicate UID (409)
       if (errMsg && errMsg.includes('409')) {
@@ -570,6 +570,7 @@ export default function TransactionPage({ user, setUser }) {
       productName:  data.product_name  || 'Unknown',
       price:        data.price         || null,
       barcode:      barcodeValue       || '',
+      mkId:         (mkIdValue || '').trim() || null,
       confidence:   data.confidence    || 0,
       fraudRisk:    data.fraud_risk    || 0,
       fraudType:    data.fraud_type    || null,
@@ -621,7 +622,9 @@ export default function TransactionPage({ user, setUser }) {
         channel: 'offline',
         items: verifiedItems
           .filter(c => c.barcode)
-          .map(c => ({ barcode: c.barcode, qty: c.qty, image_b64: c.productThumb || null })),
+          .map(c => ({ barcode: c.barcode, qty: c.qty, mk_id: c.mkId || null,
+                       product_name: c.productName || null, price: c.price ?? null,
+                       image_b64: c.productThumb || null })),
       }
       const res = await fetch('/api/checkout/pay', {
         method: 'POST',

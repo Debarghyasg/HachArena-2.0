@@ -211,6 +211,50 @@ async function saveCheckoutImage({ transactionId, shopId, barcode, imageB64, mkI
     }
 }
 
+// Persist ONE purchased unit into the customer purchase ledger (transaction_items),
+// keyed by the receipt transaction ID + customer session. This is the always-present
+// record (independent of any photo) the support chatbot uses to verify a refund:
+// the item the customer claims must match something bought under this transaction.
+async function saveTransactionItem({ transactionId, sessionId = null, userId = null, shopId = null,
+                                     barcode = null, mkId = null, productName = null,
+                                     quantity = 1, price = null, channel = 'offline',
+                                     returnWindowDays = null }) {
+    if (!transactionId) return false;
+    const days = parseInt(returnWindowDays) || parseInt(process.env.RETURN_WINDOW_DAYS) || 30;
+    try {
+        await db.query(
+            `INSERT INTO transaction_items
+               (transaction_id, session_id, user_id, shop_id, barcode, mk_id, product_name,
+                quantity, price, purchase_channel, return_eligible_until, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NOW() + ($11 || ' days')::interval, NOW())`,
+            [transactionId, sessionId, userId, shopId, barcode, mkId || null, productName,
+             Math.max(1, parseInt(quantity) || 1), (price ?? null),
+             channel === 'online' ? 'online' : 'offline', String(days)]
+        );
+        return true;
+    } catch (err) {
+        if (!saveTransactionItem._warned) { console.warn('transaction_items insert skipped (run migration_transaction_items.sql):', err.message); saveTransactionItem._warned = true; }
+        return false;
+    }
+}
+
+// Best-effort: record the unit in the per-customer purchase history (anti-fraud).
+// customer_purchases.mk_id is NOT NULL, so we only write when we have an MK-ID.
+async function saveCustomerPurchase({ userId, transactionId, mkId, barcode = null, productName = null }) {
+    if (!userId || !mkId) return false;
+    try {
+        await db.query(
+            `INSERT INTO customer_purchases (user_id, order_id, mk_id, barcode, product_name, purchased_at)
+             VALUES ($1,$2,$3,$4,$5, NOW())`,
+            [userId, transactionId || null, mkId, barcode, productName]
+        );
+        return true;
+    } catch (err) {
+        if (!saveCustomerPurchase._warned) { console.warn('customer_purchases insert skipped:', err.message); saveCustomerPurchase._warned = true; }
+        return false;
+    }
+}
+
 // Persist a delivery photo (Delivery DB) for an ONLINE order, keyed by the
 // transaction ID, so a refund claim can compare it against the dispatch image.
 async function saveDeliveryImage({ transactionId, shopId, barcode, imageB64, courier = null }) {
@@ -1135,6 +1179,10 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
             // Optional MK-ID (manufacturer serial) of the scanned unit — links
             // this transaction to the exact unit, used later for refund matching.
             mk_id: typeof i.mk_id === 'string' ? i.mk_id.trim() : null,
+            // Product name / price the client knows (authoritative values come
+            // from the products table during the stock decrement below).
+            product_name: typeof i.product_name === 'string' ? i.product_name.trim() : null,
+            price: (i.price !== undefined && i.price !== null && !isNaN(parseFloat(i.price))) ? parseFloat(i.price) : null,
         }))
         .filter(i => i.barcode.length >= 4);
 
@@ -1144,6 +1192,7 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
     const lowStock      = [];     // products whose new quantity < threshold
     const insufficient  = [];     // requested qty exceeded available
     const notFound      = [];     // barcode not in this shop's inventory
+    const soldInfo      = {};     // barcode → { product_name, price } sold in this txn
 
     try {
         await db.query('BEGIN');
@@ -1156,7 +1205,7 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
                   WHERE barcode = $2
                     AND shop_id = $3
                     AND quantity >= $1
-                  RETURNING product_name, quantity`,
+                  RETURNING product_name, quantity, price`,
                 [qty, barcode, shop.id]
             );
 
@@ -1171,7 +1220,8 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
                 continue;
             }
 
-            const { product_name, quantity } = r.rows[0];
+            const { product_name, quantity, price } = r.rows[0];
+            soldInfo[barcode] = { product_name, price };
             if (quantity < LOW_STOCK_THRESHOLD) {
                 lowStock.push({ product_name, barcode, quantity });
             }
@@ -1201,8 +1251,33 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
     // this ID (Customer DB) so a later refund claim can be verified against it.
     const transactionId   = await generateUniqueTransactionId();
     const returnWindowDays = parseInt(process.env.RETURN_WINDOW_DAYS) || 30;
+    // Customer session this sale belongs to ("transaction id based upon the session id").
+    const sessionId = shop.session_token || null;
+    const customerId = shop.session_token || (shop.role === 'customer' ? `SHOP_${shop.id}` : null);
     let imagesSaved = 0;
+    let itemsSaved  = 0;
     for (const it of cleanItems) {
+        const info = soldInfo[it.barcode] || {};
+        const productName = info.product_name || it.product_name || null;
+        const price       = info.price ?? it.price ?? null;
+
+        // 1) Always record the purchased unit in the customer purchase ledger.
+        const savedItem = await saveTransactionItem({
+            transactionId, sessionId, userId: customerId, shopId: shop.id,
+            barcode: it.barcode, mkId: it.mk_id, productName,
+            quantity: it.qty, price, channel, returnWindowDays,
+        });
+        if (savedItem) itemsSaved++;
+
+        // 2) Mirror into per-customer purchase history (anti-fraud) when we have an MK-ID.
+        if (it.mk_id) {
+            await saveCustomerPurchase({
+                userId: customerId, transactionId, mkId: it.mk_id,
+                barcode: it.barcode, productName,
+            });
+        }
+
+        // 3) Store the captured product photo (Customer DB) when one was taken.
         if (it.image_b64) {
             const ok = await saveCheckoutImage({
                 transactionId, shopId: shop.id, barcode: it.barcode,
@@ -1212,7 +1287,7 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
         }
     }
     const returnEligibleUntil = new Date(Date.now() + returnWindowDays * 86400000).toISOString();
-    console.log(`🧾 Transaction ${transactionId} issued (channel=${channel}, ${imagesSaved} checkout image(s) stored).`);
+    console.log(`🧾 Transaction ${transactionId} issued (channel=${channel}, ${itemsSaved} item(s) ledgered, ${imagesSaved} checkout image(s) stored).`);
 
     // Dedup against Redis: if we've already emailed about this barcode within
     // the last 24h, skip it. Prevents one slow-moving SKU from spamming the

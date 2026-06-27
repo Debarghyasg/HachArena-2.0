@@ -14,6 +14,7 @@ recognize_mk_id in main.py). This module owns the verification logic only, so it
 stays simple and testable.
 """
 
+from typing import Optional
 import re
 
 # MK-IDs look like "MK-MILO-2024-A001" / "MK-NVA-2024-C301".
@@ -22,7 +23,7 @@ MK_ID_RE = re.compile(r"MK-[A-Z0-9]+-\d{4}-[A-Z0-9]+", re.IGNORECASE)
 BARCODE_RE = re.compile(r"\b\d{12,13}\b")
 
 
-def extract_mk_id_from_texts(texts) -> str | None:
+def extract_mk_id_from_texts(texts) -> Optional[str]:
     """Find the first MK-ID pattern in a list of OCR text fragments."""
     for t in texts or []:
         m = MK_ID_RE.search((t or "").upper().replace(" ", ""))
@@ -31,7 +32,7 @@ def extract_mk_id_from_texts(texts) -> str | None:
     return None
 
 
-def extract_barcode_from_texts(texts) -> str | None:
+def extract_barcode_from_texts(texts) -> Optional[str]:
     for t in texts or []:
         m = BARCODE_RE.search((t or "").replace(" ", ""))
         if m:
@@ -57,23 +58,80 @@ async def get_user_purchases(db_pool, user_id: str):
         return None
 
 
-async def verify_complaint(db_pool, user_id: str, mk_id: str | None, barcode: str | None = None) -> dict:
+async def verify_complaint(db_pool, user_id: str, mk_id: "Optional[str]", barcode: "Optional[str]" = None,
+                           transaction_id: "Optional[str]" = None) -> dict:
     """
-    Cross-reference a recognised product against the user's purchase history.
+    Cross-reference a recognised product against the user's purchase history
+    AND (optionally) a specific transaction.
+
+    Flow:
+      1. If transaction_id is provided → look up the barcode sold in that txn
+         (from checkout_images) and resolve its valid MK-IDs (from MOCK_DB).
+         The OCR'd MK-ID must be one of those → proves this exact item was sold.
+      2. Otherwise → fall back to checking the user's entire purchase history.
 
     Returns one of:
-      APPROVED  — the product is in the user's history (refund may proceed)
+      APPROVED  — the product is verified (refund may proceed)
       REJECTED  — image unrecognised, user not found, or item never purchased
-      REVIEW    — purchase history temporarily unavailable (fail-soft)
+      REVIEW    — data temporarily unavailable (fail-soft)
     """
     if not mk_id and not barcode:
         return {
             "status": "REJECTED",
             "reason": "image_unrecognized",
             "message": "We couldn't identify a valid product from the photo. Please upload a clearer, "
-                       "well-lit picture that shows the product label / serial.",
+                       "well-lit picture that shows the product label / serial (MK-ID).",
         }
 
+    # ── Path A: transaction-based verification (strongest proof) ──────────────
+    if transaction_id and db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT barcode FROM checkout_images WHERE transaction_id = $1 ORDER BY created_at DESC LIMIT 1",
+                    transaction_id,
+                )
+            if row and row["barcode"]:
+                txn_barcode = row["barcode"]
+                # Resolve the valid MK-IDs for that barcode from the product DB.
+                try:
+                    from ai_core import MOCK_DB
+                except ImportError:
+                    MOCK_DB = {}
+                product = MOCK_DB.get(txn_barcode)
+                if product:
+                    valid_mk_ids = [m.upper() for m in product.get("mk_ids", [])]
+                    if mk_id and mk_id.upper() in valid_mk_ids:
+                        return {
+                            "status": "APPROVED",
+                            "reason": "transaction_verified",
+                            "message": f"Purchase verified — MK-ID {mk_id} matches {product['product_name']} "
+                                       f"sold in transaction {transaction_id}.",
+                            "context": {"transaction_id": transaction_id, "product_name": product["product_name"],
+                                        "mk_id": mk_id, "barcode": txn_barcode},
+                        }
+                    if barcode and barcode == txn_barcode:
+                        return {
+                            "status": "APPROVED",
+                            "reason": "transaction_verified",
+                            "message": f"Purchase verified — barcode {barcode} matches {product['product_name']} "
+                                       f"sold in transaction {transaction_id}.",
+                            "context": {"transaction_id": transaction_id, "product_name": product["product_name"],
+                                        "barcode": txn_barcode},
+                        }
+                    # MK-ID/barcode doesn't match what was sold in this txn → reject.
+                    return {
+                        "status": "REJECTED",
+                        "reason": "unverified_item",
+                        "message": f"The product in the photo (MK-ID: {mk_id or 'n/a'}) does not match "
+                                   f"what was sold in transaction {transaction_id} ({product['product_name']}).",
+                    }
+                # barcode not in MOCK_DB — can't resolve valid mk_ids, fall through to user history
+        except Exception as e:
+            print(f"[purchase_verifier] transaction lookup failed: {e}")
+            # fall through to user-history check
+
+    # ── Path B: user-history-based verification (fallback) ────────────────────
     purchases = await get_user_purchases(db_pool, user_id)
     if purchases is None:
         return {

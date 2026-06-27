@@ -32,7 +32,7 @@ const { Client } = require('pg');
 const TXN_OFFLINE = process.env.DEMO_TXN_OFFLINE || '100000000001';
 const TXN_ONLINE  = process.env.DEMO_TXN_ONLINE  || '100000000002';
 const SHOP_ID     = parseInt(process.env.DEMO_SHOP_ID) || 1;
-const BARCODE     = process.env.DEMO_BARCODE || '8901234567890';
+const BARCODE     = process.env.DEMO_BARCODE || '8901030823437';  // Nestle Milo (in MOCK_DB)
 const RETURN_DAYS = parseInt(process.env.RETURN_WINDOW_DAYS) || 30;
 
 const SAMPLES = path.join(__dirname, 'samples');
@@ -94,6 +94,8 @@ function toDataUrl(file) {
         console.log('         checks the product image (Customer DB)\n');
         console.log(`  🚚  ONLINE  (delivered) →  Transaction ID:  ${TXN_ONLINE}`);
         console.log('         checks the product image + delivery photo (Delivery DB)\n');
+        console.log('  Customer ID: USER_9921 (Alice) — owns MK-MILO-2024-A001 (Nestle Milo)');
+        console.log('  The OCR or provided MK-ID must match for the refund to be APPROVED.\n');
         console.log('  Tip: set AUDIT_INTACT_THRESHOLD high (0.99) for an APPROVED demo,');
         console.log('       or low (0.10) for a DENIED demo — no model retraining needed.\n');
     } catch (err) {

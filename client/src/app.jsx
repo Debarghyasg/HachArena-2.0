@@ -77,8 +77,8 @@ export default function App() {
         <Route path="/"       element={<AdminLoginPage setUser={setUser} />} />
         <Route path="/signup" element={<SignupPage />} />
         <Route path="/customer" element={<CustomerLoginPage setUser={setUser} />} />
-        <Route path="/returns" element={<ChatbotPage />} />
-        <Route path="/chat" element={<ChatbotPage />} />
+        <Route path="/returns" element={<ChatbotPage user={user} />} />
+        <Route path="/chat" element={<ChatbotPage user={user} />} />
 
         {/* ── Protected: Admin logged in → all pages accessible ── */}
         <Route path="/home"        element={<AuthGuard user={user}><HomePage        user={user} setUser={setUser} /></AuthGuard>} />

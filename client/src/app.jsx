@@ -8,6 +8,7 @@ import AdminDashboard    from './admin-dashboard.jsx'
 import CheckoutPage      from './checkout.jsx'
 import TransactionPage   from './transaction.jsx'
 import ChatbotPage       from './chatbot.jsx'
+import FloatingAssistant from './floating-assistant.jsx'
 
 function LoadingScreen() {
   return (
@@ -88,6 +89,9 @@ export default function App() {
         {/* ── Catch-all ── */}
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
+
+      {/* Chatbot is reachable from every screen once logged in */}
+      {user && <FloatingAssistant />}
     </BrowserRouter>
   )
 }

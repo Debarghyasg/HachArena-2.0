@@ -138,6 +138,7 @@ class InjectionCheckRequest(BaseModel):
 class PurchaseVerifyRequest(BaseModel):
     """Anti-fraud: verify the complained product is in the user's purchase history."""
     user_id:        str                          # customer identifier
+    transaction_id: Optional[str] = None         # the receipt transaction number
     mk_id:          Optional[str] = None         # explicit MK-ID (if scanned/typed)
     barcode:        Optional[str] = None         # explicit barcode (alternative key)
     image_b64:      Optional[str] = None         # complaint photo — OCR'd for the MK-ID/barcode
@@ -347,7 +348,7 @@ async def verify_purchase(req: PurchaseVerifyRequest):
         except Exception:
             img = None
     mk_id, barcode, method = recognize_mk_id(img, req.mk_id, req.barcode)
-    result = await purchase_verifier.verify_complaint(db_pool, req.user_id, mk_id, barcode)
+    result = await purchase_verifier.verify_complaint(db_pool, req.user_id, mk_id, barcode, req.transaction_id)
     result["recognized_mk_id"] = mk_id
     result["recognized_barcode"] = barcode
     result["recognition_method"] = method

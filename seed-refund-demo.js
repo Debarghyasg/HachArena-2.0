@@ -1,5 +1,5 @@
 /**
- * SmartRetail — Refund demo seeder (one command)
+ * Grahak Sathi — Refund demo seeder (one command)
  * ───────────────────────────────────────────────
  * Creates two ready-to-use test transactions — one for MILO and one for
  * COLGATE — so you can try the refund flow in the chatbot WITHOUT going through

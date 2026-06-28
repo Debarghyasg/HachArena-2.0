@@ -1,4 +1,4 @@
-# Nyatik Nayan
+# Grahak Sathi
 
 An intelligent retail platform built for **HackArena 2.0** that combines **real-time
 checkout fraud detection** with a **cost-aware, security-hardened conversational AI**

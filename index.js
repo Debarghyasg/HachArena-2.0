@@ -1300,9 +1300,17 @@ app.get('/api/health', async (req, res) => {
 // COST-AWARE AI — Conversational Auditor, Budget & Usage Transparency (Otari)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Resolve the budget session id for a request. Public returns-chatbot visitors
-// supply a stable client-generated id; logged-in flows fall back to express sid.
+// Resolve the budget session id for a request. Logged-in users get a budget
+// keyed to their IDENTITY, so changing the login (or ending a customer session)
+// automatically starts a fresh AI budget — instead of the previous per-browser
+// id (kept in localStorage) bleeding the spend across different logins.
+// Anonymous public returns-chatbot visitors keep their client-generated id.
 function budgetSessionId(req) {
+    const u = req.session && req.session.user;
+    if (u) {
+        if (u.session_token)    return ('sess:' + u.session_token).toString().slice(0, 64);
+        if (u.id != null)       return ('user:' + (u.role || 'u') + ':' + u.id).toString().slice(0, 64);
+    }
     const fromBody  = req.body && typeof req.body.budget_session === 'string' && req.body.budget_session.trim();
     const fromQuery = typeof req.query.budget_session === 'string' && req.query.budget_session.trim();
     return (fromBody || fromQuery || req.sessionID || 'anon').toString().slice(0, 64);

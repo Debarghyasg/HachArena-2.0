@@ -19,6 +19,8 @@ from rapidfuzz import fuzz
 from dotenv import load_dotenv
 import redis.asyncio as aioredis
 from datetime import datetime
+import re
+import asyncio
 
 import injection_model   # local self-hosted LSTM prompt-injection classifier
 import purchase_verifier # anti-fraud: cross-check complaint product vs purchase history
@@ -85,6 +87,16 @@ async def startup():
     except Exception as e:
         print(f"⚠️  Injection model init failed ({e}) — Stage-2 classifier disabled")
 
+    # Warm up the OCR reader at boot so the FIRST refund photo doesn't trigger a
+    # multi-second, event-loop-blocking model load mid-request (the usual cause
+    # of "verification unavailable: timeout"). Best-effort; never fatal.
+    try:
+        import easyocr
+        globals()["_ocr_reader"] = await asyncio.to_thread(easyocr.Reader, ["en"], False)
+        print("✅ EasyOCR reader warmed up")
+    except Exception as e:
+        print(f"ℹ️  EasyOCR warm-up skipped ({e}) — OCR will load on first use")
+
 @app.on_event("shutdown")
 async def shutdown():
     if db_pool:    await db_pool.close()
@@ -103,6 +115,7 @@ class MatchRequest(BaseModel):
     barcode_ocr:   Optional[str] = ""
     yolo_label:    Optional[str] = ""
     image_b64:     Optional[str] = None   # base64 image — triggers YOLO inference
+    mk_id:         Optional[str] = None   # manufacturer serial — validated at checkout
 
 
 class AuditImage(BaseModel):
@@ -155,6 +168,30 @@ class RefundVerifyRequest(BaseModel):
     transaction_id: str                          # REQUIRED anchor
     image_b64:      Optional[str] = None          # photo of the product being returned
     product_name:   Optional[str] = None          # product name the customer states
+
+
+class RefundPickupRequest(BaseModel):
+    """Damage + checkout-DB refund + pickup verification.
+
+    Flow (the requested behaviour):
+      1. The customer gives a transaction_id and a photo of the product (Milo /
+         Colgate, etc.).
+      2. We check whether the product in the photo is BROKEN / damaged.
+      3. If it's broken, we verify it against the checkout database for that
+         transaction (and, if a user_id is given, that user's purchase history):
+         the MK-ID read from the photo (or provided) must match what was bought.
+      4. broken + matched  -> refund request done & pickup initiated.
+         mismatched         -> no refund.
+         not broken         -> no refund (nothing to refund).
+    """
+    transaction_id: str                          # REQUIRED anchor
+    image_b64:      Optional[str] = None          # photo of the product being returned (checked for damage + OCR'd for MK-ID)
+    mk_id:          Optional[str] = None          # explicit MK-ID (if the customer typed/scanned it)
+    barcode:        Optional[str] = None          # explicit barcode (alternative identifier)
+    product_name:   Optional[str] = None          # product name the customer states (optional)
+    user_id:        Optional[str] = None          # customer id — cross-check against their purchase history
+    claim_type:     Optional[str] = None          # broken_label | damaged | seal | wrong_item | wrong_size
+    image_name:     Optional[str] = None          # uploaded filename — used by the deterministic demo damage mode
 
 
 # ── HELPER ─────────────────────────────────────────────────────────────────────
@@ -298,6 +335,66 @@ def recognize_mk_id(img, provided_mk_id=None, provided_barcode=None):
     if bc:
         return None, bc, "ocr_barcode"
     return None, None, "unrecognized"
+
+
+def _norm_mkid(s):
+    """Normalise an MK-ID for fuzzy comparison: uppercase, alphanumerics only."""
+    return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
+
+
+def _lev(a, b):
+    """Levenshtein edit distance between two short strings."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _closest_mkid(candidate, mk_id_set):
+    """Return the MK-ID from mk_id_set that the (possibly mis-OCR'd) candidate
+    refers to: an exact normalised match, or one within a single character of
+    edit distance (handles classic OCR slips like O<->0, I<->1). Else None."""
+    cn = _norm_mkid(candidate)
+    if not cn:
+        return None
+    best, best_d = None, 99
+    for mk in mk_id_set:
+        d = _lev(cn, _norm_mkid(mk))
+        if d < best_d:
+            best, best_d = mk, d
+    return best if best_d <= 1 else None
+
+
+# Deterministic demo damage mode (great for a hackathon demo): when ON (default),
+# the uploaded FILENAME decides the condition — names containing "broken"/"damaged"/
+# etc. are treated as damaged, "intact"/"sealed"/etc. as intact. This makes a demo
+# with named images (milo_broken.jpg / milo_intact.jpg) 100% reproducible without
+# depending on the visual heuristic. Set REFUND_DEMO_MODE=false to always use the model.
+REFUND_DEMO_MODE = os.getenv("REFUND_DEMO_MODE", "true").lower() in ("1", "true", "yes", "on")
+_DEMO_DAMAGED_WORDS = ("broken", "damaged", "damage", "cracked", "crushed", "torn",
+                       "leaking", "defective", "dented", "spoilt", "spoiled")
+_DEMO_INTACT_WORDS  = ("intact", "undamaged", "sealed", "good", "_ok", "fine", "new")
+
+
+def _demo_damage_from_name(name):
+    """From a filename, return True (damaged), False (intact), or None (no hint)."""
+    if not REFUND_DEMO_MODE or not name:
+        return None
+    n = name.lower()
+    if any(w in n for w in _DEMO_DAMAGED_WORDS):
+        return True
+    if any(w in n for w in _DEMO_INTACT_WORDS):
+        return False
+    return None
 
 
 # ── Transaction-anchored refund matching thresholds (env-overridable) ─────────
@@ -496,6 +593,238 @@ async def verify_refund(req: RefundVerifyRequest):
     return out
 
 
+# ── POST /audit/refund-pickup — MK-ID-anchored refund + pickup decision ───────
+@app.post("/audit/refund-pickup")
+async def refund_pickup(req: RefundPickupRequest):
+    """
+    Damage + checkout-DB refund flow:
+
+      1. Look up the MK-ID(s)/barcode(s) linked to this transaction
+         (the checkout record of what the customer bought) from checkout_images.
+      2. Read the MK-ID from the customer's photo (OCR) — or use a provided one —
+         and check whether the product in the photo looks BROKEN / damaged.
+      3. Decision:
+           broken + matches the checkout record -> refund + pickup initiated
+           doesn't match the checkout record     -> no refund (mismatch)
+           not broken                            -> no refund (nothing to refund)
+           condition unclear / no photo          -> manual review
+    """
+    out = {
+        "transaction_id": req.transaction_id,
+        "matched": False,
+        "damaged": None,
+        "intact": None,
+        "refund_done": False,
+        "reason": None,
+        "message": None,
+    }
+
+    # 1. Which MK-IDs / barcodes / products are linked to this transaction?
+    #    Source = the customer purchase ledger (transaction_items) MERGED with any
+    #    stored checkout photos (checkout_images), so both real self-checkouts and
+    #    seeded/imaged demos resolve.
+    txn_rows = []
+    if db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                # (a) canonical purchase ledger — may not exist pre-migration
+                try:
+                    ti = await conn.fetch(
+                        "SELECT mk_id, barcode, product_name FROM transaction_items "
+                        "WHERE transaction_id = $1 ORDER BY created_at DESC",
+                        req.transaction_id,
+                    )
+                except Exception as ti_err:
+                    print(f"[refund-pickup] transaction_items unavailable: {ti_err}")
+                    ti = []
+                # (b) captured checkout photos (mk_id column may not exist pre-migration)
+                try:
+                    ci = await conn.fetch(
+                        "SELECT mk_id, barcode FROM checkout_images "
+                        "WHERE transaction_id = $1 ORDER BY created_at DESC",
+                        req.transaction_id,
+                    )
+                except Exception as ci_err:
+                    print(f"[refund-pickup] checkout_images mk_id unavailable, barcode-only: {ci_err}")
+                    ci = await conn.fetch(
+                        "SELECT barcode FROM checkout_images "
+                        "WHERE transaction_id = $1 ORDER BY created_at DESC",
+                        req.transaction_id,
+                    )
+            txn_rows = [dict(r) for r in ti] + [dict(r) for r in ci]
+        except Exception as e:
+            print(f"[refund-pickup] transaction lookup failed: {e}")
+            out["reason"] = "lookup_error"
+            out["message"] = ("I couldn't access the transaction records right now. "
+                              "Please try again in a moment.")
+            return out
+
+    if not txn_rows:
+        out["reason"] = "transaction_not_found"
+        out["message"] = (f"No purchase was found for transaction {req.transaction_id}. "
+                          f"Please double-check the transaction ID on your receipt.")
+        return out
+
+    txn_mk_ids   = {(r["mk_id"] or "").upper() for r in txn_rows if r.get("mk_id")}
+    txn_barcodes = {r["barcode"] for r in txn_rows if r.get("barcode")}
+    # Real product names sold under this transaction (from the ledger), keyed by barcode.
+    txn_names = {}
+    for r in txn_rows:
+        if r.get("barcode") and r.get("product_name"):
+            txn_names.setdefault(r["barcode"], r["product_name"])
+
+    # 2. Recognise the product, and prepare to inspect the photo for damage.
+    #    The photo is used for BOTH: (a) OCR'ing the MK-ID (unless one was
+    #    provided) and (b) assessing whether the product is broken.
+    img = None
+    if req.image_b64:
+        try:
+            img = _decode_image(req.image_b64)
+        except Exception:
+            img = None
+
+    # Recognition is heavy (OCR) — run off the event loop so it can't block
+    # other requests or trip the client timeout.
+    mk_id, barcode, method = await asyncio.to_thread(
+        recognize_mk_id, img, req.mk_id, req.barcode
+    )
+    out["recognized_mk_id"]   = mk_id
+    out["recognized_barcode"] = barcode
+    out["recognition_method"] = method
+
+    if not mk_id and not barcode:
+        out["reason"] = "unrecognized"
+        out["message"] = ("I couldn't read a product MK-ID from your photo. Please upload a clearer, "
+                          "well-lit picture that shows the product's serial / MK-ID label, "
+                          "or enter the MK-ID directly.")
+        return out
+
+    # 3. Match the recognised identifier against this transaction's checkout record.
+    try:
+        from ai_core import MOCK_DB
+    except Exception:
+        MOCK_DB = {}
+
+    matched_barcode = None
+    if mk_id and mk_id.upper() in txn_mk_ids:
+        for r in txn_rows:
+            if (r.get("mk_id") or "").upper() == mk_id.upper():
+                matched_barcode = r.get("barcode")
+                break
+        out["matched"] = True
+    elif barcode and barcode in txn_barcodes:
+        matched_barcode = barcode
+        out["matched"] = True
+    elif mk_id and not txn_mk_ids and txn_barcodes:
+        # Legacy rows without a stored mk_id: validate against MOCK_DB serials.
+        for bc in txn_barcodes:
+            product = MOCK_DB.get(bc)
+            if product and mk_id.upper() in [m.upper() for m in product.get("mk_ids", [])]:
+                matched_barcode = bc
+                out["matched"] = True
+                break
+
+    # Tolerant fallback: a single OCR slip (O<->0, lost hyphen) still matches.
+    if not out["matched"] and mk_id and txn_mk_ids:
+        canon = _closest_mkid(mk_id, txn_mk_ids)
+        if canon:
+            mk_id = canon
+            out["recognized_mk_id"] = canon
+            out["recognition_method"] = (method or "ocr_mk_id") + "+fuzzy"
+            for r in txn_rows:
+                if (r.get("mk_id") or "").upper() == canon:
+                    matched_barcode = r.get("barcode")
+                    break
+            out["matched"] = True
+
+    # Optional extra anti-fraud gate: if a user_id is supplied, the item must
+    # ALSO exist in THAT user's purchase history (their checkout database).
+    if out["matched"] and req.user_id:
+        try:
+            history = await purchase_verifier.get_user_purchases(db_pool, req.user_id)
+        except Exception:
+            history = None
+        if history:  # only enforce when we could actually read the history
+            owns = any(
+                (mk_id and (h.get("mk_id") or "").upper() == mk_id.upper())
+                or (matched_barcode and (h.get("barcode") or "") == matched_barcode)
+                for h in history
+            )
+            if not owns:
+                out["matched"] = False
+                out["reason"] = "not_in_user_history"
+
+    product      = MOCK_DB.get(matched_barcode) if matched_barcode else None
+    product_name = (txn_names.get(matched_barcode)
+                    or (product["product_name"] if product else None)
+                    or req.product_name)
+    out["product_name"] = product_name
+    out["barcode"]      = matched_barcode
+    identifier = mk_id or barcode
+
+    # 4. Inspect the photo for damage (broken / not intact).
+    damage = {"intact": None, "model_available": False}
+    if img is not None:
+        damage = await asyncio.to_thread(_analyze_intactness, img)
+    intact = damage.get("intact")
+    damage_source = "model" if damage.get("model_available") else "none"
+
+    # Deterministic demo override: the uploaded filename decides the condition
+    # (e.g. milo_broken.jpg -> damaged, milo_intact.jpg -> intact) when
+    # REFUND_DEMO_MODE is on. Falls back to the model when there's no hint.
+    demo_verdict = _demo_damage_from_name(req.image_name)
+    if demo_verdict is not None:
+        intact = (not demo_verdict)
+        damage_source = "filename_demo"
+
+    out["intact"]         = intact
+    out["damaged"]        = (intact is False)
+    out["damage_finding"] = {
+        "source":          damage_source,
+        "top_label":       damage.get("top_label"),
+        "top_conf":        damage.get("top_conf"),
+        "sharpness":       damage.get("sharpness"),
+        "model_available": damage.get("model_available"),
+    }
+
+    # 5. Decide: refund ONLY when the item is BROKEN *and* matches the checkout record.
+    if not out["matched"]:
+        out["reason"] = out["reason"] or "mkid_mismatch"
+        out["message"] = (
+            f"Refund not possible — the product in your photo (MK-ID {identifier}) doesn't match the item "
+            f"purchased under transaction {req.transaction_id}. No refund will be issued."
+        )
+        return out
+
+    if intact is None:
+        # Couldn't assess condition (no photo, or the model couldn't tell).
+        out["reason"] = "condition_unknown"
+        out["message"] = (
+            f"I verified {product_name or 'your item'} (MK-ID {identifier}) against transaction "
+            f"{req.transaction_id}, but I couldn't tell from the photo whether it's damaged. "
+            f"Please upload a clear, well-lit photo of the damaged area so I can complete the refund."
+        )
+        return out
+
+    if not out["damaged"]:
+        out["reason"] = "item_intact"
+        out["message"] = (
+            f"The {product_name or 'item'} in your photo (MK-ID {identifier}) appears intact / undamaged, "
+            f"so a refund isn't applicable. If it is faulty, please upload a photo that clearly shows the damage."
+        )
+        return out
+
+    # Broken + matched -> refund + pickup.
+    out["refund_done"] = True
+    out["reason"] = "verified_damaged"
+    out["message"] = (
+        f"Refund request done and pickup initiated for {product_name or 'your item'} "
+        f"(MK-ID {identifier}) under transaction {req.transaction_id} — the item was verified as damaged "
+        f"and matches your purchase."
+    )
+    return out
+
+
 # ── POST /verify — called by Node.js checkout gateway ─────────────────────────
 @app.post("/verify")
 async def verify_barcode(req: VerifyRequest):
@@ -634,7 +963,7 @@ async def match_verify(req: MatchRequest):
     elif fraud_risk > 0.55:
         fraud_type = "LOW_CONFIDENCE"
 
-    return {
+    result = {
         "found":          True,
         "match":          fraud_risk <= 0.5,
         "confidence":     max(0, 100 - int(fraud_risk * 100)),
@@ -646,6 +975,30 @@ async def match_verify(req: MatchRequest):
         "barcode_format": product["barcode_format"],
         "yolo_label":     yolo_label or None,
     }
+
+    # ── MK-ID (manufacturer serial) validation — counterfeit / swapped-unit check ──
+    # The barcode + image may match the genuine product, but a SWAPPED/incorrect
+    # MK-ID means this physical unit isn't a genuine serial. Only enforce when we
+    # actually know the valid serials for this barcode (product_catalog); this is
+    # a lightweight import (no YOLO/EasyOCR).
+    if req.mk_id:
+        from product_catalog import validate_mk_id, is_known_barcode
+        result["mk_id"] = req.mk_id
+        if is_known_barcode(req.barcode_value):
+            valid = validate_mk_id(req.barcode_value, req.mk_id)
+            result["mk_id_valid"] = valid
+            if not valid:
+                result["match"]      = False
+                result["confidence"] = 0
+                result["fraud_type"] = "MK_ID_MISMATCH"
+                result["message"]    = (f"MK ID '{req.mk_id}' is not a valid serial for "
+                                        f"{product['product_name']} (barcode {req.barcode_value}) — "
+                                        f"possible counterfeit or swapped unit.")
+        else:
+            # No serial list for this barcode → the MK-ID can't be verified.
+            result["mk_id_valid"] = None
+
+    return result
 
 
 # ── GET /inventory ─────────────────────────────────────────────────────────────

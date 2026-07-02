@@ -1047,6 +1047,135 @@ const CAPTURE_STATE = Object.freeze({
     BLOCKED:          'blocked',           // auto / manager-rejected / timeout block
 });
 
+// ── Capture write resilience + lane-health policy ─────────────────────────────
+// Local-storage writes can hiccup (disk pressure, transient fs error). Rather
+// than dropping the audit image on the first failure, retry with exponential
+// backoff (1s → 2s → 4s over 3 attempts). If every attempt fails, the store's
+// policy decides what happens next:
+//   • hard_block    → refuse the capture (no image ⇒ this item can't proceed)
+//   • hmac_fallback → the HMAC token already proved the scan cleared the gate, so
+//                     accept a LOGGED, image-less capture and let checkout continue
+//                     — but only up to LANE_FAULT_MAX degraded captures within
+//                     LANE_FAULT_WINDOW; beyond that the lane is FROZEN (a
+//                     persistent storage/hardware fault needs an attendant).
+// Camera hardware faults reported by the terminal feed the SAME rolling counter,
+// so a dying camera trips the same lane-freeze path instead of silently skipping.
+const CAPTURE_WRITE_MAX_ATTEMPTS   = parseInt(process.env.CAPTURE_WRITE_MAX_ATTEMPTS)   || 3;
+const CAPTURE_WRITE_BASE_DELAY_MS  = parseInt(process.env.CAPTURE_WRITE_BASE_DELAY_MS)  || 1000;   // 1s → 2s → 4s
+const CAPTURE_WRITE_FAILURE_POLICY = (process.env.CAPTURE_WRITE_FAILURE_POLICY || 'hmac_fallback').toLowerCase();
+const LANE_FAULT_MAX      = parseInt(process.env.LANE_FAULT_MAX)      || 3;            // degraded captures allowed…
+const LANE_FAULT_WINDOW_S = parseInt(process.env.LANE_FAULT_WINDOW_S) || 15 * 60;     // …within this rolling window (15 min)
+const LANE_FREEZE_TTL_S   = parseInt(process.env.LANE_FREEZE_TTL_S)   || 15 * 60;     // freeze auto-thaws after this
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Generic exponential-backoff retry: runs fn up to `attempts` times with delays
+// baseDelayMs, 2×, 4×, … (default 1s → 2s → 4s). Returns fn's result, or throws
+// the last error once all attempts are exhausted.
+async function retryWithBackoff(fn, { attempts = 3, baseDelayMs = 1000, label = 'operation' } = {}) {
+    let lastErr;
+    for (let i = 0; i < attempts; i++) {
+        try { return await fn(i); }
+        catch (e) {
+            lastErr = e;
+            if (i < attempts - 1) {
+                const delay = baseDelayMs * (2 ** i);
+                console.warn(`⏳ ${label} failed (attempt ${i + 1}/${attempts}): ${e.message} — retrying in ${delay}ms`);
+                await sleep(delay);
+            }
+        }
+    }
+    throw lastErr;
+}
+
+function laneFaultKey(shopId)  { return `capture:fault:${shopId}`; }
+function laneFrozenKey(shopId) { return `lane:frozen:${shopId}`; }
+
+// Rolling counter of degraded captures (HMAC-only write fallbacks + camera
+// hardware faults) for a lane over the last LANE_FAULT_WINDOW_S. First increment
+// sets the TTL so the window rolls. Returns the new count (0 on Redis error →
+// fail-open, never blocks checkout on a counter hiccup).
+async function recordLaneFault(shopId, kind, detail) {
+    let count = 0;
+    try {
+        count = await redisClient.incr(laneFaultKey(shopId));
+        if (count === 1) await redisClient.expire(laneFaultKey(shopId), LANE_FAULT_WINDOW_S);
+    } catch (e) { console.warn('lane fault counter error (fail-open):', e.message); }
+    console.warn(`⚠️  Lane fault [${kind}] shop ${shopId} — ${count}/${LANE_FAULT_MAX} in ${Math.round(LANE_FAULT_WINDOW_S / 60)}min: ${detail || ''}`);
+    return count;
+}
+
+async function isLaneFrozen(shopId) {
+    try { return (await redisClient.get(laneFrozenKey(shopId))) != null; }
+    catch { return false; }
+}
+
+// Freeze a checkout lane: set a Redis flag (auto-thaws after LANE_FREEZE_TTL_S),
+// push a LANE_FROZEN event to the shop's terminals — the checkout-hardware analog
+// of the SESSION_EXPIRED "counter closed" broadcast — and log the incident.
+async function freezeLane(shopId, reason) {
+    try {
+        await redisClient.set(laneFrozenKey(shopId),
+            JSON.stringify({ reason, at: new Date().toISOString() }), { EX: LANE_FREEZE_TTL_S });
+    } catch (e) { console.warn('lane freeze set failed:', e.message); }
+    broadcastToShop(shopId, {
+        type: 'LANE_FROZEN',
+        reason,
+        message: reason || 'Checkout lane frozen — capture subsystem fault. Please call an attendant.',
+        auto_thaw_seconds: LANE_FREEZE_TTL_S,
+    });
+    console.error(`🧊 LANE FROZEN — shop ${shopId}: ${reason}`);
+    try {
+        await db.query(
+            `INSERT INTO fraud_incidents (shop_id, barcode, product_name, risk_score, action, incident_at)
+             VALUES ($1,$2,$3,$4,$5,NOW())`,
+            [shopId, 'LANE', 'Capture subsystem', 1.0, 'LANE_FROZEN'],
+        );
+    } catch (e) { /* audit insert is best-effort */ }
+}
+
+// All local-write retries are exhausted. Apply the store's write-failure policy.
+// Returns the Express response. Callable only after the HMAC gate has passed, so
+// the scan itself is already proven legitimate.
+async function handleCaptureWriteFailure(res, shop, payload, state, err) {
+    console.error(`💾 Capture write FAILED after ${CAPTURE_WRITE_MAX_ATTEMPTS} attempts — shop ${shop.id}, txn ${payload.txn_ref}: ${err.message}`);
+
+    // Policy A: hard block — no stored image means this item cannot proceed.
+    if (CAPTURE_WRITE_FAILURE_POLICY === 'hard_block') {
+        state.status = CAPTURE_STATE.BLOCKED;
+        state.write_error = err.message;
+        await commitCaptureState(state, { reason: 'write_failed', message: 'Could not store the checkout image — capture blocked.' });
+        return res.status(507).json({ ok: false, policy: 'hard_block', message: 'Could not store the checkout image after retries. Capture blocked.' });
+    }
+
+    // Policy B: logged HMAC-only fallback — the gate-pass token proves the scan
+    // was verified, so accept an image-less capture and let checkout continue.
+    // Cap these: past LANE_FAULT_MAX within the window, freeze the lane.
+    const count = await recordLaneFault(shop.id, 'write_fallback', `${payload.txn_ref}: ${err.message}`);
+    if (count > LANE_FAULT_MAX) {
+        await freezeLane(shop.id, `Repeated checkout-image write failures (${count} in ${Math.round(LANE_FAULT_WINDOW_S / 60)} min).`);
+        state.status = CAPTURE_STATE.BLOCKED;
+        state.write_error = err.message;
+        await commitCaptureState(state, { reason: 'lane_frozen', message: 'Lane frozen after repeated storage faults.' });
+        return res.status(423).json({ ok: false, frozen: true, policy: 'hmac_fallback', message: 'Repeated storage faults — lane frozen. Please call an attendant.' });
+    }
+
+    // Accept: image-less, HMAC-verified, logged. No image ⇒ nothing for YOLO to
+    // score, so the item clears (fail-open, consistent with no_reference_image)
+    // but is flagged unauditable in the state for the audit trail.
+    state.status   = CAPTURE_STATE.APPROVED;
+    state.image    = null;
+    state.fallback = { mode: 'hmac_only', write_error: err.message, at: new Date().toISOString(), fault_count: count };
+    await commitCaptureState(state, {
+        fallback: 'hmac_only', scored: false, reason: 'write_failed',
+        message: `Image storage unavailable — HMAC-verified capture accepted without image (${count}/${LANE_FAULT_MAX}).`,
+    });
+    return res.status(200).json({
+        ok: true, fallback: 'hmac_only', txn_ref: payload.txn_ref, faults: count,
+        message: 'Checkout image could not be stored; scan is HMAC-verified so checkout continues (logged).',
+    });
+}
+
 // Sign a compact HMAC token: base64url(payload) + "." + base64url(HMAC-SHA256).
 function signCaptureToken(payload) {
     const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
@@ -1826,14 +1955,36 @@ app.post('/api/checkout/capture', isAuth, async (req, res) => {
     if (state.image)   // idempotent: a frame is already bound to this txn
         return res.status(200).json({ ok: true, already: true, txn_ref: payload.txn_ref, image_ref: state.image });
 
+    // A frozen lane refuses new captures until an attendant clears it (or it auto-thaws).
+    if (await isLaneFrozen(shop.id))
+        return res.status(423).json({ ok: false, frozen: true, message: 'Checkout lane is frozen due to a capture subsystem fault. Please call an attendant.' });
+
+    // Reject obviously-bad input up front (client error) so it never enters the
+    // retry/fallback path or counts as a storage fault.
+    let precheck = null;
+    try {
+        let b64 = image_b64.startsWith('data:') ? image_b64.slice(image_b64.indexOf(',') + 1) : image_b64;
+        precheck = Buffer.from(b64, 'base64');
+    } catch { precheck = null; }
+    if (!precheck || precheck.length === 0)
+        return res.status(400).json({ ok: false, message: 'image_b64 is empty or not valid base64.' });
+
     // image_uploading → tell the display we've received the frame and are writing it.
     state.status = CAPTURE_STATE.IMAGE_UPLOADING;
     await commitCaptureState(state);
 
-    // 3) LOCAL WRITE + CHECKSUM VERIFICATION (replaces the S3 multipart upload).
+    // 3) LOCAL WRITE + CHECKSUM VERIFICATION with exponential-backoff retry
+    //    (1s → 2s → 4s, 3 attempts) so a transient disk hiccup doesn't drop the
+    //    audit image. If every attempt fails, hand off to the store failure policy.
     let ref;
-    try { ref = writeCaptureLocally(shop.id, payload.txn_ref, image_b64); }
-    catch (e) { return res.status(422).json({ ok: false, message: 'Capture write/verify failed: ' + e.message }); }
+    try {
+        ref = await retryWithBackoff(
+            () => writeCaptureLocally(shop.id, payload.txn_ref, image_b64),
+            { attempts: CAPTURE_WRITE_MAX_ATTEMPTS, baseDelayMs: CAPTURE_WRITE_BASE_DELAY_MS, label: `capture write ${payload.txn_ref}` },
+        );
+    } catch (e) {
+        return await handleCaptureWriteFailure(res, shop, payload, state, e);
+    }
 
     // 4) Bind the transaction-scoped image reference to the Redis state.
     //    image_uploaded → frame persisted + checksum-verified.
@@ -1866,6 +2017,37 @@ app.get('/api/checkout/capture/:txnRef', isAuth, async (req, res) => {
     if (!state) return res.status(404).json({ ok: false, message: 'Capture state not found or expired.' });
     if (state.shop_id !== shop.id) return res.status(403).json({ ok: false, message: 'Not your transaction.' });
     return res.json({ ok: true, ...state });
+});
+
+// POST /api/checkout/capture-fault — the terminal reports it could NOT produce a
+// camera frame for an APPROVED scan because of a HARDWARE fault (camera was ready
+// then stopped yielding frames). A store that simply has no camera degrades to a
+// best-effort skip client-side and never calls this. This routes a genuine camera
+// fault into the SAME lane-health counter as storage write-fallbacks, so a dying
+// camera trips the lane-freeze path cleanly rather than silently skipping the
+// vision step. Requires a valid gate-pass token (only verified scans can report).
+app.post('/api/checkout/capture-fault', isAuth, async (req, res) => {
+    const shop = req.session.user;
+    const { capture_token, reason } = req.body || {};
+    const payload = verifyCaptureToken(capture_token);
+    if (!payload || payload.shop_id !== shop.id)
+        return res.status(401).json({ ok: false, message: 'Missing or invalid capture authorization.' });
+
+    const count = await recordLaneFault(shop.id, 'camera_fault', `${payload.txn_ref}: ${reason || 'no frame'}`);
+
+    // The scan is HMAC-verified but has no image → fail-open (clears), flagged as
+    // a camera fault for the audit trail and the live display.
+    await transitionCaptureState(payload.txn_ref, CAPTURE_STATE.APPROVED, {
+        shopId: shop.id, barcode: payload.barcode, scored: false, reason: 'camera_fault',
+        fallback: 'no_camera_frame',
+        message: 'Camera fault — capture skipped; scan is HMAC-verified.',
+    });
+
+    if (count > LANE_FAULT_MAX) {
+        await freezeLane(shop.id, `Repeated camera faults (${count} in ${Math.round(LANE_FAULT_WINDOW_S / 60)} min).`);
+        return res.status(423).json({ ok: false, frozen: true, faults: count, message: 'Repeated camera faults — lane frozen. Please call an attendant.' });
+    }
+    return res.json({ ok: true, logged: true, faults: count });
 });
 
 app.post('/api/checkout/match-verify', isAuth, async (req, res) => {
@@ -2822,6 +3004,29 @@ app.post('/api/admin/capture-thresholds', isAdmin, async (req, res) => {
     const resolved = await captureThresholds.set(shopId, { autoApprove, autoBlock });
     console.log(`🎚️  Capture-match thresholds for shop ${shopId} set to approve>${resolved.autoApprove}, block<=${resolved.autoBlock}`);
     res.json({ shopId, ...resolved, updated: true });
+});
+
+// GET /api/admin/lane/status — is this lane frozen, and current fault count.
+app.get('/api/admin/lane/status', isAdmin, async (req, res) => {
+    const shopId = req.session.user.id;
+    let frozen = null, faults = 0;
+    try {
+        const raw = await redisClient.get(laneFrozenKey(shopId));
+        frozen = raw ? JSON.parse(raw) : null;
+        faults = parseInt(await redisClient.get(laneFaultKey(shopId))) || 0;
+    } catch { /* fail-soft */ }
+    res.json({ shopId, frozen: !!frozen, detail: frozen, faults, faultCap: LANE_FAULT_MAX, windowSeconds: LANE_FAULT_WINDOW_S });
+});
+
+// POST /api/admin/lane/unfreeze — clear a lane freeze after an attendant fixes the
+// camera/disk. (Freezes also auto-thaw after LANE_FREEZE_TTL_S.)
+app.post('/api/admin/lane/unfreeze', isAdmin, async (req, res) => {
+    const shopId = req.session.user.id;
+    try { await redisClient.del(laneFrozenKey(shopId)); await redisClient.del(laneFaultKey(shopId)); }
+    catch (e) { console.warn('lane unfreeze cleanup error:', e.message); }
+    broadcastToShop(shopId, { type: 'LANE_THAWED', message: 'Checkout lane restored — you can resume scanning.' });
+    console.log(`✅ Lane thawed by admin — shop ${shopId}`);
+    res.json({ ok: true, frozen: false });
 });
 
 // POST /api/checkout/capture-review/:txnRef — manager approve/reject tap.

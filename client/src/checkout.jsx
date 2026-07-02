@@ -42,6 +42,7 @@ export default function CheckoutPage({ user, setUser }) {
   const [toast, setToast]         = useState({ msg:'', type:'', show:false })
   const [flash, setFlash]         = useState('')
   const [captureStatus, setCaptureStatus] = useState(null)   // { txnRef, state:'capturing'|'stored'|'skipped'|'error', ref?, reason? }
+  const [laneFrozen, setLaneFrozen] = useState(null)         // { message } when the lane is frozen by a capture-subsystem fault
   const [cameraReady, setCameraReady] = useState(false)
   const scanBufferRef = useRef('')
   const scanTimerRef  = useRef(null)
@@ -93,6 +94,9 @@ export default function CheckoutPage({ user, setUser }) {
               : v)
           }
         }
+        // Capture subsystem fault froze / restored the whole lane.
+        if (msg.type === 'LANE_FROZEN') handleLaneFrozen(msg.message)
+        if (msg.type === 'LANE_THAWED') { setLaneFrozen(null); showToast(msg.message || 'Lane restored — resume scanning.', 'info') }
       } catch {}
     }
     ws.onerror = () => {}
@@ -133,6 +137,14 @@ export default function CheckoutPage({ user, setUser }) {
 
   function flashScreen(color) {
     setFlash(color); setTimeout(() => setFlash(''), 300)
+  }
+
+  // Capture subsystem fault (repeated storage write failures or camera faults)
+  // froze the lane server-side. Surface it prominently and pause scanning until
+  // it's cleared (admin unfreeze) or auto-thaws.
+  function handleLaneFrozen(message) {
+    setLaneFrozen({ message: message || 'Checkout lane frozen — capture subsystem fault. Please call an attendant.' })
+    showToast(message || 'Lane frozen — capture subsystem fault', 'error')
   }
 
   async function logout() {
@@ -181,7 +193,26 @@ export default function CheckoutPage({ user, setUser }) {
     if (!data?.capture_token) return
     const txnRef = data.txn_ref
     const frame = grabFrame()
-    if (!frame) { setCaptureStatus({ txnRef, state:'skipped', reason: cameraReady ? 'no frame' : 'camera unavailable' }); return }
+    if (!frame) {
+      // Camera was READY but produced no frame → a genuine hardware fault. Report
+      // it so it feeds the lane-health counter (→ lane freeze past the cap),
+      // rather than silently skipping the vision step. A store with no camera at
+      // all just degrades to a best-effort skip (no fault reported).
+      if (cameraReady) {
+        setCaptureStatus({ txnRef, state:'camera_fault', reason:'camera not yielding frames' })
+        try {
+          const res = await fetch('/api/checkout/capture-fault', {
+            method:'POST', headers:{ 'Content-Type':'application/json' }, credentials:'include',
+            body: JSON.stringify({ capture_token: data.capture_token, reason:'no frame from ready camera' }),
+          })
+          const out = await res.json().catch(()=>({}))
+          if (res.status === 423 && out.frozen) handleLaneFrozen(out.message)
+        } catch { /* report is best-effort; the scan already passed the gate */ }
+      } else {
+        setCaptureStatus({ txnRef, state:'skipped', reason:'camera unavailable' })
+      }
+      return
+    }
     setCaptureStatus({ txnRef, state:'capturing' })
     try {
       const res = await fetch('/api/checkout/capture', {
@@ -189,8 +220,18 @@ export default function CheckoutPage({ user, setUser }) {
         body: JSON.stringify({ capture_token: data.capture_token, image_b64: frame }),
       })
       const out = await res.json().catch(()=>({}))
-      if (res.ok && out.ok) setCaptureStatus({ txnRef, state:'stored', ref: out.image_ref })
-      else setCaptureStatus({ txnRef, state:'error', reason: out.message || `HTTP ${res.status}` })
+      if (res.status === 423 && out.frozen) {
+        handleLaneFrozen(out.message)
+        setCaptureStatus({ txnRef, state:'blocked', reason: out.message })
+      } else if (res.ok && out.ok && out.fallback === 'hmac_only') {
+        // Storage was unavailable; the scan is HMAC-verified so checkout continues,
+        // but the capture is image-less/unauditable — surface it as degraded.
+        setCaptureStatus({ txnRef, state:'fallback', reason: out.message })
+      } else if (res.ok && out.ok) {
+        setCaptureStatus({ txnRef, state:'stored', ref: out.image_ref })
+      } else {
+        setCaptureStatus({ txnRef, state:'error', reason: out.message || `HTTP ${res.status}` })
+      }
     } catch (e) {
       setCaptureStatus({ txnRef, state:'error', reason: e.message })
     }
@@ -199,6 +240,7 @@ export default function CheckoutPage({ user, setUser }) {
 
   const handleScan = useCallback(async (barcode) => {
     if (!barcode || barcode.length < 4 || loading) return
+    if (laneFrozen) { showToast('Lane is frozen — scanning paused until restored.', 'warn'); return }
     activeBarcode.current = barcode
     setLoading(true)
     setGateLocked(true)
@@ -273,7 +315,7 @@ export default function CheckoutPage({ user, setUser }) {
       setGateLocked(false)
       activeBarcode.current = ''
     }
-  }, [loading])
+  }, [loading, laneFrozen])
 
   function addAlert(type, detail, cls='fraud') {
     setAlerts(prev => [{ type, detail, time:new Date().toLocaleTimeString(), cls }, ...prev])
@@ -335,6 +377,14 @@ export default function CheckoutPage({ user, setUser }) {
 
       {/* Flash overlay */}
       <div style={{position:'fixed',inset:0,zIndex:500,pointerEvents:'none',opacity:flash?1:0,background:flash==='green'?'rgba(134,239,172,.06)':flash==='red'?'rgba(252,165,165,.06)':'transparent',transition:'opacity .1s'}} />
+
+      {/* Lane frozen banner — capture subsystem fault; scanning is paused. */}
+      {laneFrozen && (
+        <div style={{position:'fixed',top:0,left:0,right:0,zIndex:1000,padding:'14px 20px',background:'rgba(60,10,10,.97)',borderBottom:'2px solid #fca5a5',color:'#fecaca',fontFamily:"'Sora',sans-serif",fontSize:14,fontWeight:600,display:'flex',alignItems:'center',justifyContent:'center',gap:10,boxShadow:'0 6px 24px rgba(0,0,0,.5)'}}>
+          <span style={{fontSize:18}}>🧊</span>
+          <span>Lane frozen — {laneFrozen.message || 'capture subsystem fault'}. Scanning is paused until an attendant restores the lane.</span>
+        </div>
+      )}
 
       {/* Overhead capture camera (hidden) — a frame is grabbed on gate-pass */}
       <video ref={videoRef} muted playsInline style={{ position:'fixed', width:1, height:1, opacity:0, pointerEvents:'none', bottom:0, right:0 }} />
@@ -624,6 +674,8 @@ export default function CheckoutPage({ user, setUser }) {
           pending_manager:  { label: 'Waiting for manager…', color:'#fcd34d', spin:true },
           approved:         { label: 'Match approved',       color:'#86efac' },
           blocked:          { label: 'Blocked — mismatch',   color:'#fca5a5' },
+          fallback:         { label: 'Storage down — HMAC-verified (no image)', color:'#fcd34d' },
+          camera_fault:     { label: 'Camera fault — capture skipped',           color:'#fca5a5' },
           skipped:          { label: 'Capture skipped',      color:'#9ca3af' },
           error:            { label: 'Capture unavailable',  color:'#9ca3af' },
         }[captureStatus.state] || { label: captureStatus.state, color:'#a78bfa' }

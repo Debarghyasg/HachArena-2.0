@@ -3,6 +3,12 @@ client/dist/
 .env
 uploads/
 
+# Per-SKU reference profile images are runtime store assets (per-shop product
+# photos), not source — ignore the actual image files but keep the folder so the
+# path convention (store-data/reference-images/{shop_id}/{barcode}.jpg) is visible.
+store-data/reference-images/*
+!store-data/reference-images/.gitkeep
+
 
 # Python bytecode / caches
 __pycache__/

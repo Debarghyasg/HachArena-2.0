@@ -1508,6 +1508,266 @@ app.get('/api/inventory', isAuth, async (req, res) => {
     catch { res.json({ products: [] }); }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PER-SKU REFERENCE PROFILE IMAGES
+// ─────────────────────────────────────────────────────────────────────────────
+// A reference profile image is the canonical photo of a product, captured ONCE
+// per SKU at first stock intake and reused for every unit of that SKU. This
+// system has no `sku` column — the per-product-type key IS the barcode, and
+// `mk_id` is the per-unit serial — so one image per barcode == one per SKU.
+//
+// Storage convention (filesystem, NOT base64-in-DB, because these are long-lived,
+// low-cardinality, reused assets):
+//
+//     store-data/reference-images/{shop_id}/{barcode}.jpg
+//
+// The inventory row links to it via products.reference_image_path (+ status).
+// Reference images are scoped per shop so they never leak across tenants; they
+// are served through a guarded, per-shop route (never express.static) so a
+// barcode can't be enumerated across stores.
+const REFERENCE_IMAGES_ROOT = process.env.REFERENCE_IMAGES_DIR
+    ? path.resolve(process.env.REFERENCE_IMAGES_DIR)
+    : path.join(__dirname, 'store-data', 'reference-images');
+
+// Missing-reference-image policy when receiving a NEW SKU with no image yet:
+//   'flag'  (default) — receive the stock but mark the SKU pending, so a manager
+//                       can upload the photo later. Never blocks goods intake.
+//   'block'           — refuse to receive that SKU line until a reference image
+//                       is supplied. Strict, for stores that want hard enforcement.
+const REFERENCE_IMAGE_POLICY =
+    (process.env.REFERENCE_IMAGE_POLICY || 'flag').toLowerCase() === 'block' ? 'block' : 'flag';
+
+// Barcode/SKU must be filesystem-safe: this also prevents path traversal since
+// it forbids '/', '\' and '..' in the segment used to build the file path.
+function isValidSku(barcode) {
+    return /^[A-Za-z0-9._-]{4,64}$/.test(String(barcode || '').trim());
+}
+function referenceImageAbsPath(shopId, barcode) {
+    return path.join(REFERENCE_IMAGES_ROOT, String(shopId), `${barcode}.jpg`);
+}
+// Canonical relative path stored in the DB + returned to clients.
+function referenceImageRelPath(shopId, barcode) {
+    return `store-data/reference-images/${shopId}/${barcode}.jpg`;
+}
+function referenceImageExists(shopId, barcode) {
+    try { return fs.existsSync(referenceImageAbsPath(shopId, barcode)); } catch { return false; }
+}
+// Decode a base64 / data-URL image and write it to the convention path.
+function saveReferenceImageFile(shopId, barcode, imageB64) {
+    let b64 = String(imageB64 || '');
+    if (b64.startsWith('data:')) {
+        const idx = b64.indexOf(',');
+        if (idx !== -1) b64 = b64.slice(idx + 1);
+    }
+    const buf = Buffer.from(b64, 'base64');
+    if (!buf || buf.length === 0) throw new Error('empty or invalid image data');
+    fs.mkdirSync(path.join(REFERENCE_IMAGES_ROOT, String(shopId)), { recursive: true });
+    fs.writeFileSync(referenceImageAbsPath(shopId, barcode), buf);
+    return referenceImageRelPath(shopId, barcode);
+}
+// Best-effort link of the reference image onto the inventory row. Fails soft so
+// a pre-migration install (missing columns) never breaks stock receiving.
+async function linkReferenceImage(shopId, barcode, relPath, status) {
+    try {
+        await db.query(
+            `UPDATE products
+                SET reference_image_path       = COALESCE($1, reference_image_path),
+                    reference_image_status     = $2,
+                    reference_image_updated_at = CASE WHEN $1 IS NOT NULL THEN NOW() ELSE reference_image_updated_at END
+              WHERE barcode = $3 AND shop_id = $4`,
+            [relPath, status, barcode, shopId]
+        );
+        return true;
+    } catch (err) {
+        if (!linkReferenceImage._warned) { console.warn('reference image link skipped (run migration_reference_images.sql):', err.message); linkReferenceImage._warned = true; }
+        return false;
+    }
+}
+
+// POST /api/inventory/receive — RECEIVING / STOCK INTAKE.
+// Body: { items: [{ barcode, quantity, product_name?, price?, barcode_format?,
+//                    reference_image_b64?, replace_reference? }], channel? }
+// For each line it (a) resolves the SKU's reference image — capture-once-then-
+// reuse — applying the missing-image policy, then (b) receives stock by
+// incrementing the existing product row or inserting a new SKU.
+app.post('/api/inventory/receive', isAuth, async (req, res) => {
+    const shop  = req.session.user;
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (items.length === 0)
+        return res.status(400).json({ ok: false, message: 'No items to receive.' });
+
+    const clean = items.map(i => ({
+        barcode:             String(i.barcode || '').trim(),
+        product_name:        typeof i.product_name === 'string' ? i.product_name.trim() : null,
+        price:               (i.price != null && !isNaN(parseFloat(i.price))) ? parseFloat(i.price) : null,
+        quantity:            Math.max(0, parseInt(i.quantity ?? i.qty) || 0),
+        barcode_format:      typeof i.barcode_format === 'string' ? i.barcode_format.trim() : null,
+        reference_image_b64: typeof i.reference_image_b64 === 'string' ? i.reference_image_b64 : null,
+        replace_reference:   i.replace_reference === true,
+    })).filter(i => isValidSku(i.barcode) && i.quantity >= 1);
+
+    if (clean.length === 0)
+        return res.status(400).json({ ok: false, message: 'No valid items (each needs a barcode and quantity >= 1).' });
+
+    const received = [], pendingReference = [], blocked = [];
+
+    for (const it of clean) {
+        // ── 1) Resolve the reference image (capture once per SKU, reuse after) ──
+        let refPath = null, refStatus = 'pending', reused = false;
+        const hasExisting = referenceImageExists(shop.id, it.barcode);
+
+        if (it.reference_image_b64 && (!hasExisting || it.replace_reference)) {
+            // First-intake capture (or explicit replace): write the photo to disk.
+            try { refPath = saveReferenceImageFile(shop.id, it.barcode, it.reference_image_b64); refStatus = 'linked'; }
+            catch (e) { console.warn(`reference image save failed for ${it.barcode}:`, e.message); }
+        }
+        if (!refPath && hasExisting) {
+            // Already photographed on a prior intake — reuse it for these new units.
+            refPath = referenceImageRelPath(shop.id, it.barcode); refStatus = 'linked'; reused = true;
+        }
+
+        if (!refPath && !hasExisting && REFERENCE_IMAGE_POLICY === 'block') {
+            // Strict policy: do NOT receive this SKU until a reference image exists.
+            blocked.push({ barcode: it.barcode, product_name: it.product_name, reason: 'no_reference_image' });
+            continue;
+        }
+        // Otherwise (flag policy, or image resolved) we proceed; refStatus stays
+        // 'pending' when no image is on file yet.
+
+        // ── 2) Receive stock: increment existing SKU, else insert a new one ─────
+        let row = null, isNew = false;
+        try {
+            const upd = await db.query(
+                `UPDATE products
+                    SET quantity = quantity + $1,
+                        price    = COALESCE($2, price)
+                  WHERE barcode = $3 AND shop_id = $4
+                  RETURNING product_name, quantity`,
+                [it.quantity, it.price, it.barcode, shop.id]
+            );
+            if (upd.rowCount > 0) {
+                row = upd.rows[0];
+            } else {
+                if (!it.product_name) {
+                    blocked.push({ barcode: it.barcode, reason: 'new_sku_missing_product_name' });
+                    continue;
+                }
+                const ins = await db.query(
+                    `INSERT INTO products (barcode, product_name, price, quantity, barcode_format, shop_id, created_at)
+                     VALUES ($1,$2,$3,$4,$5,$6,NOW())
+                     RETURNING product_name, quantity`,
+                    [it.barcode, it.product_name, it.price ?? 0, it.quantity, it.barcode_format, shop.id]
+                );
+                row = ins.rows[0];
+                isNew = true;
+            }
+        } catch (err) {
+            console.error(`receive stock error for ${it.barcode}:`, err.message);
+            blocked.push({ barcode: it.barcode, reason: 'db_error' });
+            continue;
+        }
+
+        // ── 3) Link the reference image onto the freshly-received row ───────────
+        await linkReferenceImage(shop.id, it.barcode, refPath, refStatus);
+
+        const entry = {
+            barcode: it.barcode,
+            product_name: row.product_name,
+            quantity: row.quantity,
+            is_new_sku: isNew,
+            reference_image_path: refPath,
+            reference_image_status: refStatus,
+            reference_reused: reused,
+        };
+        received.push(entry);
+        if (refStatus === 'pending') pendingReference.push({ barcode: it.barcode, product_name: row.product_name });
+    }
+
+    const okAll = blocked.length === 0;
+    let message;
+    if (blocked.length && REFERENCE_IMAGE_POLICY === 'block')
+        message = 'Some SKUs were blocked pending a reference image.';
+    else if (blocked.length)
+        message = 'Some items could not be received.';
+    else if (pendingReference.length)
+        message = 'Stock received. Some SKUs still need a reference image (flagged for manager upload).';
+    else
+        message = 'Stock received and all SKUs linked to a reference image.';
+
+    return res.status(okAll ? 200 : 207).json({
+        ok: okAll,
+        policy: REFERENCE_IMAGE_POLICY,
+        receivedCount: received.length,
+        received,
+        pendingReference,
+        blocked,
+        message,
+    });
+});
+
+// POST /api/inventory/reference-image — manager uploads/replaces a SKU's photo
+// (used to clear a 'pending' flag). Body: { barcode, image_b64, replace? }.
+app.post('/api/inventory/reference-image', isAuth, async (req, res) => {
+    const shop = req.session.user;
+    const { barcode, image_b64, replace } = req.body || {};
+    const sku = String(barcode || '').trim();
+    if (!isValidSku(sku))
+        return res.status(400).json({ ok: false, message: 'A valid barcode is required.' });
+    if (!image_b64)
+        return res.status(400).json({ ok: false, message: 'image_b64 is required.' });
+
+    const exists = referenceImageExists(shop.id, sku);
+    if (exists && replace !== true)
+        return res.status(409).json({
+            ok: false,
+            message: 'A reference image already exists for this SKU. Pass replace:true to overwrite.',
+            reference_image_path: referenceImageRelPath(shop.id, sku),
+        });
+
+    let relPath;
+    try { relPath = saveReferenceImageFile(shop.id, sku, image_b64); }
+    catch (e) { return res.status(400).json({ ok: false, message: 'Invalid image data.' }); }
+
+    await linkReferenceImage(shop.id, sku, relPath, 'linked');
+    console.log(`🖼️  Reference image ${exists ? 'replaced' : 'set'} for shop ${shop.id} SKU ${sku}`);
+    return res.json({ ok: true, barcode: sku, reference_image_path: relPath, replaced: !!exists });
+});
+
+// GET /api/inventory/reference-images/pending — SKUs still awaiting a photo
+// (the manager upload queue).
+app.get('/api/inventory/reference-images/pending', isAuth, async (req, res) => {
+    const shop = req.session.user;
+    try {
+        const r = await db.query(
+            `SELECT barcode, product_name, quantity, reference_image_status
+               FROM products
+              WHERE shop_id = $1
+                AND (reference_image_path IS NULL OR reference_image_status IS DISTINCT FROM 'linked')
+              ORDER BY product_name`,
+            [shop.id]
+        );
+        res.json({ count: r.rowCount, items: r.rows });
+    } catch (err) {
+        if (!app._pendingRefWarned) { console.warn('pending reference query skipped (run migration_reference_images.sql):', err.message); app._pendingRefWarned = true; }
+        res.json({ count: 0, items: [], note: 'run migration_reference_images.sql' });
+    }
+});
+
+// GET /api/inventory/reference-image/:barcode — stream a SKU's reference image,
+// scoped to the caller's shop (guarded; not statically served).
+app.get('/api/inventory/reference-image/:barcode', isAuth, (req, res) => {
+    const shop = req.session.user;
+    const sku  = String(req.params.barcode || '').trim();
+    if (!isValidSku(sku))
+        return res.status(400).json({ ok: false, message: 'Invalid barcode.' });
+    const abs = referenceImageAbsPath(shop.id, sku);
+    if (!fs.existsSync(abs))
+        return res.status(404).json({ ok: false, message: 'No reference image for this SKU.' });
+    res.type('image/jpeg');
+    return res.sendFile(abs);
+});
+
+
 app.get('/api/health', async (req, res) => {
     let redisOk = false, dbOk = false;
     try { await redisClient.ping(); redisOk = true; } catch {}

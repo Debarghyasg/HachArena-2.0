@@ -15,6 +15,8 @@ export default function AdminDashboard({ user, setUser }) {
   const [usage, setUsage]             = useState(null)
   const [budgetInput, setBudgetInput] = useState('')
   const [savingBudget, setSavingBudget] = useState(false)
+  const [pendingRefs, setPendingRefs]   = useState(null)   // { count, items }
+  const [uploadingRef, setUploadingRef] = useState(null)   // barcode currently uploading
 
   useEffect(() => {
     const link = document.createElement('link')
@@ -23,6 +25,7 @@ export default function AdminDashboard({ user, setUser }) {
     if (!document.querySelector(`link[href="${link.href}"]`)) document.head.appendChild(link)
     fetchSessions()
     fetchUsage()
+    fetchPendingRefs()
     const interval = setInterval(() => { fetchSessions(); fetchUsage() }, 10000)
     return () => clearInterval(interval)
   }, [])
@@ -32,6 +35,39 @@ export default function AdminDashboard({ user, setUser }) {
       const res = await fetch('/api/admin/usage-transparency', { credentials: 'include' })
       if (res.ok) setUsage(await res.json())
     } catch {}
+  }
+
+  // ── Per-SKU reference images: fetch the "pending upload" queue ──────────────
+  async function fetchPendingRefs() {
+    try {
+      const res = await fetch('/api/inventory/reference-images/pending', { credentials: 'include' })
+      if (res.ok) setPendingRefs(await res.json())
+    } catch {}
+  }
+
+  // Manager uploads a reference photo for a flagged SKU (file -> base64 -> API).
+  function uploadReference(barcode, file) {
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = async () => {
+      setUploadingRef(barcode)
+      try {
+        const res = await fetch('/api/inventory/reference-image', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ barcode, image_b64: reader.result }),
+        })
+        const data = await res.json()
+        if (res.ok) { showToast(`Reference image set for ${barcode}`, 'success'); fetchPendingRefs() }
+        else showToast(data.message || 'Upload failed.', 'error')
+      } catch {
+        showToast('Connection error.', 'error')
+      } finally {
+        setUploadingRef(null)
+      }
+    }
+    reader.readAsDataURL(file)
   }
 
   async function saveBudget() {
@@ -329,6 +365,46 @@ export default function AdminDashboard({ user, setUser }) {
               }}>
                 {creating ? '…' : '+ Create Session'}
               </button>
+            </div>
+          </div>
+
+          {/* ── Per-SKU reference images: manager upload queue ── */}
+          <div style={{ background:'rgba(8,3,18,.88)', border:'1px solid rgba(109,40,217,.22)', borderRadius:18, overflow:'hidden', marginBottom:20, animation:'cardIn .6s .28s cubic-bezier(.22,1,.36,1) both' }}>
+            <div style={{ padding:'14px 22px', borderBottom:'1px solid rgba(109,40,217,.15)', background:'rgba(0,0,0,.3)', display:'flex', alignItems:'center', gap:10 }}>
+              <span style={{ fontSize:15 }}>🖼️</span>
+              <span style={{ fontSize:13, fontWeight:700, color:'#e9d5ff' }}>Reference Images</span>
+              <span style={{ fontSize:10, color:'#64748b', fontFamily:'monospace' }}>one photo per SKU, reused for every unit</span>
+              <span style={{ marginLeft:'auto', fontFamily:'monospace', fontSize:11, color: (pendingRefs?.count) ? '#fbbf24' : '#86efac' }}>
+                {pendingRefs?.count ? `${pendingRefs.count} pending` : 'all linked'}
+              </span>
+            </div>
+            <div style={{ padding:'8px 0' }}>
+              {!pendingRefs && (
+                <div style={{ padding:'16px 22px', fontFamily:'monospace', fontSize:12, color:'#64748b' }}>Loading…</div>
+              )}
+              {pendingRefs && pendingRefs.count === 0 && (
+                <div style={{ padding:'16px 22px', fontFamily:'monospace', fontSize:12, color:'#86efac' }}>
+                  ✅ Every SKU in inventory has a reference image.
+                </div>
+              )}
+              {pendingRefs && (pendingRefs.items || []).map((it, i) => (
+                <div key={i} style={{ display:'flex', alignItems:'center', gap:12, padding:'10px 22px', borderTop: i>0 ? '1px solid rgba(109,40,217,.08)' : 'none' }}>
+                  <div style={{ flex:1, minWidth:0 }}>
+                    <div style={{ fontFamily:"'Sora',sans-serif", fontSize:13, color:'#e9d5ff', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{it.product_name || '(unnamed SKU)'}</div>
+                    <div style={{ fontFamily:'monospace', fontSize:10, color:'#4c1d95', marginTop:2 }}>{it.barcode} · qty {it.quantity ?? '—'}</div>
+                  </div>
+                  <span style={{ fontFamily:'monospace', fontSize:9, letterSpacing:'.5px', padding:'3px 8px', borderRadius:6, color:'#fbbf24', background:'rgba(251,191,36,.1)', border:'1px solid rgba(251,191,36,.3)' }}>PENDING</span>
+                  <label style={{ padding:'6px 12px', borderRadius:8, cursor: uploadingRef===it.barcode ? 'wait':'pointer', fontSize:11, fontWeight:700, fontFamily:"'Sora',sans-serif", background:'linear-gradient(135deg,#7c3aed,#5b21b6)', color:'#fff', opacity: uploadingRef===it.barcode ? .5 : 1, whiteSpace:'nowrap' }}>
+                    {uploadingRef===it.barcode ? 'Uploading…' : '📷 Upload'}
+                    <input type="file" accept="image/*" style={{ display:'none' }}
+                      disabled={uploadingRef===it.barcode}
+                      onChange={e => uploadReference(it.barcode, e.target.files?.[0])} />
+                  </label>
+                </div>
+              ))}
+              {pendingRefs?.note && (
+                <div style={{ padding:'10px 22px', fontFamily:'monospace', fontSize:10, color:'#fb923c' }}>⚠ {pendingRefs.note}</div>
+              )}
             </div>
           </div>
 

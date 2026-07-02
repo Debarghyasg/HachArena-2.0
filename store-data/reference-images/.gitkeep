@@ -1,0 +1,12 @@
+# Per-SKU reference profile images live here at runtime.
+#
+# Convention:  store-data/reference-images/{shop_id}/{barcode}.jpg
+#
+#   - One image per SKU (barcode), captured once at first stock intake and
+#     reused for every unit of that SKU.
+#   - Scoped per shop_id so the same barcode can carry different packaging
+#     across stores and never leaks between tenants.
+#   - The inventory row links to it via products.reference_image_path.
+#
+# The actual .jpg files are git-ignored (see .gitignore); this .gitkeep only
+# preserves the directory + documents the convention in the repo.

@@ -1017,6 +1017,20 @@ const CHECKOUT_CAPTURES_ROOT = process.env.CHECKOUT_CAPTURES_DIR
 if ((process.env.CAPTURE_HMAC_SECRET || '').length === 0 && process.env.NODE_ENV === 'production')
     console.warn('⚠  CAPTURE_HMAC_SECRET not set — falling back to SESSION_SECRET for capture tokens.');
 
+// ── Capture-match decision thresholds ────────────────────────────────────────
+// The 0–1 capture↔reference confidence branches into an action:
+//   score >  approve            → auto_approve   (finalize the sale)
+//   block < score ≤ approve     → manager_review (hold for a human)
+//   score ≤  block              → auto_block     (fraud-alert flow)
+// These are DEFAULTS only — each store can override them (retailers table /
+// admin endpoint) so sensitivity is tunable per store, never hardcoded.
+const CAPTURE_APPROVE_THRESHOLD = (() => { const v = parseFloat(process.env.CAPTURE_APPROVE_THRESHOLD); return isNaN(v) ? 0.90 : v; })();
+const CAPTURE_BLOCK_THRESHOLD   = (() => { const v = parseFloat(process.env.CAPTURE_BLOCK_THRESHOLD);   return isNaN(v) ? 0.60 : v; })();
+// When true, an auto_approve decision finalizes the item (inventory decrement +
+// return-list insert + low-stock check). A store can set false to keep the
+// decision advisory-only.
+const CAPTURE_AUTOFINALIZE = String(process.env.CAPTURE_AUTOFINALIZE || 'true').toLowerCase() !== 'false';
+
 function captureStateKey(txnRef) { return `txn:capture:${txnRef}`; }
 
 // Sign a compact HMAC token: base64url(payload) + "." + base64url(HMAC-SHA256).
@@ -1085,6 +1099,105 @@ async function issueCaptureAuthorization(shop, barcode, mkId, verifyResult) {
     };
 }
 
+// Read this store's tunable sensitivity thresholds (falls back to env defaults
+// pre-migration or when unset). Guarantees block < approve so the three bands
+// are always well-formed.
+async function getCaptureThresholds(shopId) {
+    let approve = CAPTURE_APPROVE_THRESHOLD, block = CAPTURE_BLOCK_THRESHOLD;
+    try {
+        const q = await db.query('SELECT capture_approve_threshold, capture_block_threshold FROM retailers WHERE id = $1', [shopId]);
+        if (q.rows[0]) {
+            if (q.rows[0].capture_approve_threshold != null) approve = parseFloat(q.rows[0].capture_approve_threshold);
+            if (q.rows[0].capture_block_threshold   != null) block   = parseFloat(q.rows[0].capture_block_threshold);
+        }
+    } catch { /* columns missing pre-migration → env defaults */ }
+    if (!(block < approve)) { approve = CAPTURE_APPROVE_THRESHOLD; block = CAPTURE_BLOCK_THRESHOLD; }  // sanity guard
+    return { approve, block };
+}
+
+// Threshold branching: score > approve → auto_approve; score ≤ block →
+// auto_block; in between → manager_review. An inconclusive score (null, e.g. no
+// detection) is routed to a human rather than silently approved/blocked.
+function decideFromScore(score, { approve, block }) {
+    if (score == null) return 'manager_review';
+    if (score > approve) return 'auto_approve';
+    if (score <= block)  return 'auto_block';
+    return 'manager_review';
+}
+
+// Persist the resolved decision on the most recent transaction row for this
+// shop+barcode (audit trail + manager-review queue). Fails soft pre-migration.
+async function persistCaptureDecision(shopId, barcode, decision) {
+    try {
+        await db.query(
+            `UPDATE transactions
+                SET capture_decision = $1
+              WHERE id = (SELECT id FROM transactions
+                           WHERE shop_id = $2 AND barcode = $3
+                           ORDER BY scanned_at DESC LIMIT 1)`,
+            [decision, shopId, barcode]
+        );
+    } catch (e) {
+        if (!persistCaptureDecision._warned) { console.warn('capture decision persist skipped (run migration_capture_decision.sql):', e.message); persistCaptureDecision._warned = true; }
+    }
+}
+
+// AUTO-APPROVE action — wire into the existing post-approval actions: decrement
+// inventory (reusing the /api/checkout/pay pattern), insert the item into the
+// Return List (transaction_items ledger, making it return-eligible), and run the
+// low-stock check (reusing the dedup + email helpers).
+async function finalizeAutoApprovedItem(shop, { barcode, mkId = null, productName = null, price = null, captureRef = null }) {
+    const out = { inventory: null, returnListTxnId: null, lowStock: null };
+
+    // 1) Inventory delete — decrement the one scanned unit (atomic, like pay).
+    let dec = null;
+    try {
+        const r = await db.query(
+            `UPDATE products SET quantity = quantity - 1
+              WHERE barcode = $1 AND shop_id = $2 AND quantity >= 1
+              RETURNING product_name, quantity, price`,
+            [barcode, shop.id]
+        );
+        dec = r.rows[0] || null;
+    } catch (e) { console.warn('auto-approve inventory decrement failed:', e.message); }
+    out.inventory = dec ? { product_name: dec.product_name, remaining: dec.quantity } : { skipped: 'no_stock_or_missing_sku' };
+
+    const finalName  = productName || (dec && dec.product_name) || null;
+    const finalPrice = (price != null) ? price : (dec ? dec.price : null);
+
+    // 2) Return List insert — record the sold unit in the transaction_items
+    //    ledger so it becomes return-eligible (same helper the pay flow uses).
+    const txnId = await generateUniqueTransactionId();
+    const saved = await saveTransactionItem({
+        transactionId: txnId, shopId: shop.id, barcode, mkId,
+        productName: finalName, quantity: 1, price: finalPrice, channel: 'offline',
+    });
+    if (saved) out.returnListTxnId = txnId;
+
+    // 3) Low-stock check — reuse dedup + email so an auto-approved sale that
+    //    drops a SKU below threshold still notifies the manager (once/24h).
+    if (dec && dec.quantity < LOW_STOCK_THRESHOLD) {
+        const low = [{ product_name: dec.product_name, barcode, quantity: dec.quantity }];
+        const toNotify = await dedupLowStockNotifications(shop.id, low);
+        if (toNotify.length > 0) sendLowStockEmail(shop, toNotify).catch(err => console.error('Low-stock email error:', err.message));
+        out.lowStock = low;
+    }
+
+    console.log(`✅ Auto-approved capture ${captureRef || ''} → finalized ${barcode} (txn ${txnId}, remaining ${dec ? dec.quantity : 'n/a'})`);
+    return out;
+}
+
+// MANAGER-REVIEW action — hold for a human: log it and push a review event to
+// the shop's terminals/dashboard. The decision is also persisted on the
+// transaction row (indexed) so it surfaces in the manager-review queue.
+async function notifyManagerReview(shop, { barcode, productName = null, score = null, captureRef = null }) {
+    console.warn(`🔶 Manager review needed — shop ${shop.id}, ${barcode} (${productName || 'unknown'}), match ${score}`);
+    broadcastToShop(shop.id, {
+        type: 'CAPTURE_REVIEW',
+        barcode, product_name: productName, confidence: score, txn_ref: captureRef,
+    });
+}
+
 // Merge a match result into the transaction-scoped capture state in Redis
 // (preserving the remaining TTL). This is the audit trail for the score.
 async function updateCaptureMatch(txnRef, match) {
@@ -1103,7 +1216,8 @@ async function updateCaptureMatch(txnRef, match) {
 // off the checkout critical path so it can never add scan/checkout latency; the
 // score lands on the transaction record + Redis state a moment later for the
 // audit trail and manager-review path.
-async function scoreCaptureMatch(shopId, txnRef, state, ref) {
+async function scoreCaptureMatch(shop, txnRef, state, ref) {
+    const shopId  = shop.id;
     const barcode = state && state.barcode;
     if (!barcode) return;
 
@@ -1130,10 +1244,41 @@ async function scoreCaptureMatch(shopId, txnRef, state, ref) {
             barcode,
         }, { timeout: 20000 });
         const d = r.data || {};
+
+        // ── Threshold branching (per-store thresholds) ───────────────────────
+        const thresholds = await getCaptureThresholds(shopId);
+        const decision   = decideFromScore(d.confidence, thresholds);
+        await persistCaptureDecision(shopId, barcode, decision);
+
+        // Take the wired action for this decision.
+        let action = null;
+        if (decision === 'auto_approve') {
+            action = CAPTURE_AUTOFINALIZE
+                ? await finalizeAutoApprovedItem(shop, { barcode, mkId: state.mk_id, productName: state.product_name, price: null, captureRef: txnRef })
+                : { finalize: 'disabled' };
+        } else if (decision === 'auto_block') {
+            // Wire into the existing fraud-alert flow (manager email + logging +
+            // live explanation + escalation). Vision mismatch = high risk.
+            await raiseFraudAlert(shop, {
+                barcode,
+                verifyResult: {
+                    product_name: state.product_name,
+                    fraud_risk:   d.confidence != null ? parseFloat((1 - d.confidence).toFixed(2)) : 0.99,
+                    status:       'blocked',
+                },
+                intelligenceFlags: [`VISION_MISMATCH (capture match ${d.confidence != null ? d.confidence : 'inconclusive'})`],
+            });
+        } else {
+            await notifyManagerReview(shop, { barcode, productName: state.product_name, score: d.confidence, captureRef: txnRef });
+        }
+
         await updateCaptureMatch(txnRef, {
             scored:          d.confidence != null,
             confidence:      d.confidence ?? null,
             match:           d.match ?? null,
+            decision,
+            thresholds,
+            action,
             checkout_label:  d.checkout_label ?? null,
             reference_label: d.reference_label ?? null,
             latency_ms:      d.latency_ms ?? null,
@@ -1142,10 +1287,64 @@ async function scoreCaptureMatch(shopId, txnRef, state, ref) {
             reason:          d.reason ?? null,
             at:              new Date().toISOString(),
         });
-        console.log(`🔎 Capture match ${txnRef}: confidence=${d.confidence}, match=${d.match} (${d.latency_ms}ms)`);
+
+        // Tell the terminal what the vision layer decided for this scan.
+        broadcastToShop(shopId, {
+            type: 'CAPTURE_DECISION',
+            txn_ref: txnRef, barcode, decision,
+            confidence: d.confidence ?? null,
+        });
+
+        console.log(`🔎 Capture match ${txnRef}: confidence=${d.confidence}, decision=${decision} (${d.latency_ms}ms)`);
     } catch (e) {
         await updateCaptureMatch(txnRef, { scored: false, reason: 'match_service_error: ' + e.message, at: new Date().toISOString() });
     }
+}
+
+// Raise a fraud alert for a barcode: bump the Redis flag counter, push the
+// plain-English "why blocked?" explanation to the live UI, email the shop, and
+// escalate to an incident report after repeated flags. Extracted from the
+// /api/checkout/verify blocked branch so BOTH the scan-time block and the
+// vision auto-block path trigger the exact same alerting. Returns the
+// explanation ({text, source}) so callers can echo it on their response.
+async function raiseFraudAlert(shop, { barcode, verifyResult, intelligenceFlags = [] }) {
+    const fraudKey = `fraud:flag:${shop.id}:${barcode}`;
+    let flagData   = { count: 0, first_seen: new Date().toISOString() };
+    try {
+        const existing = await redisClient.get(fraudKey);
+        if (existing) flagData = JSON.parse(existing);
+    } catch {}
+    flagData.count++;
+    flagData.last_seen = new Date().toISOString();
+    await redisClient.set(fraudKey, JSON.stringify(flagData), { EX: 86400 }).catch(() => {});
+
+    const explanation = await broadcastFraudExplanation(shop, {
+        barcode,
+        product_name: verifyResult.product_name,
+        risk_score:   verifyResult.fraud_risk,
+        action:       'TRANSACTION_BLOCKED',
+        intelligence_flags: intelligenceFlags,
+    }).catch(err => { console.warn('Fraud explanation broadcast failed:', err.message); return null; });
+
+    sendFraudAlertEmail(shop, {
+        barcode,
+        product_name: verifyResult.product_name,
+        risk_score:   verifyResult.fraud_risk,
+        timestamp:    new Date().toISOString(),
+        action:       'TRANSACTION_BLOCKED',
+        intelligence_flags: intelligenceFlags.join(' | '),
+        ai_explanation:      explanation ? explanation.text : null,
+        explanation_source:  explanation ? explanation.source : null,
+    }).catch(console.error);
+
+    if (flagData.count >= 3 && !flagData.escalated) {
+        flagData.escalated = true;
+        await redisClient.set(fraudKey, JSON.stringify(flagData), { EX: 86400 }).catch(() => {});
+        sendFraudIncidentReport(shop, barcode, verifyResult, flagData).catch(console.error);
+        console.warn(`🚨 Escalated fraud incident: barcode ${barcode} flagged ${flagData.count}x`);
+    }
+
+    return explanation;
 }
 
 // ── CHECKOUT ──────────────────────────────────────────────────────────────────
@@ -1273,52 +1472,17 @@ app.post('/api/checkout/verify', isAuth, async (req, res) => {
         }
 
         if (verifyResult.status === 'blocked' && (verifyResult.fraud_risk || 0) > 0.6) {
-            const fraudKey = `fraud:flag:${shop.id}:${barcode.trim()}`;
-            let flagData   = { count: 0, first_seen: new Date().toISOString() };
-            try {
-                const existing = await redisClient.get(fraudKey);
-                if (existing) flagData = JSON.parse(existing);
-            } catch {}
-            flagData.count++;
-            flagData.last_seen = new Date().toISOString();
-            await redisClient.set(fraudKey, JSON.stringify(flagData), { EX: 86400 }).catch(() => {});
-
-            // Generate the plain-English "why blocked?" explanation ONCE, then
-            // reuse it for both the live UI (WebSocket) and the fraud email.
-            // broadcastFraudExplanation pushes an instant rule-based answer and,
-            // if Otari is configured, upgrades it to an LLM narrative.
-            const explanation = await broadcastFraudExplanation(shop, {
-                barcode:      barcode.trim(),
-                product_name: verifyResult.product_name,
-                risk_score:   verifyResult.fraud_risk,
-                action:       'TRANSACTION_BLOCKED',
-                intelligence_flags: intelligenceFlags,
-            }).catch(err => { console.warn('Fraud explanation broadcast failed:', err.message); return null; });
-
-            // Embed on the result so the TXN_RESULT broadcast + HTTP response
-            // (both sent after this block) carry the explanation too, instead of
-            // racing/overwriting the FRAUD_EXPLANATION message on the client.
+            // Reuse the shared fraud-alert flow (flag count + live explanation +
+            // email + escalation). Embed the explanation on the result so the
+            // TXN_RESULT broadcast + HTTP response carry it too.
+            const explanation = await raiseFraudAlert(shop, {
+                barcode: barcode.trim(),
+                verifyResult,
+                intelligenceFlags,
+            });
             if (explanation) {
                 verifyResult.ai_explanation        = explanation.text;
                 verifyResult.ai_explanation_source = explanation.source;
-            }
-
-            sendFraudAlertEmail(shop, {
-                barcode:      barcode.trim(),
-                product_name: verifyResult.product_name,
-                risk_score:   verifyResult.fraud_risk,
-                timestamp:    new Date().toISOString(),
-                action:       'TRANSACTION_BLOCKED',
-                intelligence_flags: intelligenceFlags.join(' | '),
-                ai_explanation:      explanation ? explanation.text : null,
-                explanation_source:  explanation ? explanation.source : null,
-            }).catch(console.error);
-
-            if (flagData.count >= 3 && !flagData.escalated) {
-                flagData.escalated = true;
-                await redisClient.set(fraudKey, JSON.stringify(flagData), { EX: 86400 }).catch(() => {});
-                sendFraudIncidentReport(shop, barcode.trim(), verifyResult, flagData).catch(console.error);
-                console.warn(`🚨 Escalated fraud incident: barcode ${barcode} flagged ${flagData.count}x`);
             }
         }
 
@@ -1397,7 +1561,7 @@ app.post('/api/checkout/capture', isAuth, async (req, res) => {
     // Fire-and-forget: score the capture against the SKU reference image AFTER
     // responding, so the YOLO comparison is off the checkout critical path and
     // adds no lag. The 0–1 score is persisted to the transaction + Redis state.
-    scoreCaptureMatch(shop.id, payload.txn_ref, state, ref)
+    scoreCaptureMatch(shop, payload.txn_ref, state, ref)
         .catch(e => console.warn('capture match dispatch failed (non-fatal):', e.message));
     return;
 });
@@ -2293,6 +2457,44 @@ app.post('/api/admin/monthly-budget', isAdmin, async (req, res) => {
     const snap = await budgetEngine.setStoreLimit(shopId, rounded);
     console.log(`💵 Monthly AI budget for shop ${shopId} set to $${rounded}`);
     res.json({ ...snap, updated: true });
+});
+
+// GET /api/admin/capture-thresholds — this store's vision-match sensitivity.
+app.get('/api/admin/capture-thresholds', isAdmin, async (req, res) => {
+    const t = await getCaptureThresholds(req.session.user.id);
+    res.json({
+        approve_threshold: t.approve,
+        block_threshold:   t.block,
+        defaults: { approve: CAPTURE_APPROVE_THRESHOLD, block: CAPTURE_BLOCK_THRESHOLD },
+        bands: {
+            auto_approve:   `> ${t.approve}`,
+            manager_review: `${t.block} – ${t.approve}`,
+            auto_block:     `≤ ${t.block}`,
+        },
+    });
+});
+
+// POST /api/admin/capture-thresholds — tune this store's sensitivity.
+// Body: { approve_threshold, block_threshold } (0 < block < approve ≤ 1).
+app.post('/api/admin/capture-thresholds', isAdmin, async (req, res) => {
+    const shopId  = req.session.user.id;
+    const approve = parseFloat(req.body?.approve_threshold);
+    const block   = parseFloat(req.body?.block_threshold);
+    if (isNaN(approve) || isNaN(block) || approve <= 0 || approve > 1 || block < 0 || block >= approve)
+        return res.status(400).json({ message: 'Require 0 ≤ block_threshold < approve_threshold ≤ 1.' });
+
+    const a = Math.round(approve * 1000) / 1000;
+    const b = Math.round(block   * 1000) / 1000;
+    try {
+        await db.query(
+            'UPDATE retailers SET capture_approve_threshold = $1, capture_block_threshold = $2 WHERE id = $3',
+            [a, b, shopId]
+        );
+    } catch (err) {
+        return res.status(500).json({ message: 'Could not save thresholds (run migration_capture_decision.sql).' });
+    }
+    console.log(`🎚️  Capture thresholds for shop ${shopId} set to approve>${a}, block≤${b}`);
+    res.json({ approve_threshold: a, block_threshold: b, updated: true });
 });
 
 

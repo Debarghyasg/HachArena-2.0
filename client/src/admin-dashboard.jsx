@@ -17,6 +17,9 @@ export default function AdminDashboard({ user, setUser }) {
   const [savingBudget, setSavingBudget] = useState(false)
   const [pendingRefs, setPendingRefs]   = useState(null)   // { count, items }
   const [uploadingRef, setUploadingRef] = useState(null)   // barcode currently uploading
+  const [thresholds, setThresholds]     = useState(null)   // { approve_threshold, block_threshold, ... }
+  const [threshInput, setThreshInput]   = useState({ approve:'', block:'' })
+  const [savingThresh, setSavingThresh] = useState(false)
 
   useEffect(() => {
     const link = document.createElement('link')
@@ -26,6 +29,7 @@ export default function AdminDashboard({ user, setUser }) {
     fetchSessions()
     fetchUsage()
     fetchPendingRefs()
+    fetchCaptureThresholds()
     const interval = setInterval(() => { fetchSessions(); fetchUsage() }, 10000)
     return () => clearInterval(interval)
   }, [])
@@ -68,6 +72,43 @@ export default function AdminDashboard({ user, setUser }) {
       }
     }
     reader.readAsDataURL(file)
+  }
+
+  // ── Capture-match sensitivity thresholds (per store) ────────────────────────
+  async function fetchCaptureThresholds() {
+    try {
+      const res = await fetch('/api/admin/capture-thresholds', { credentials: 'include' })
+      if (res.ok) setThresholds(await res.json())
+    } catch {}
+  }
+
+  async function saveCaptureThresholds() {
+    const approve = parseFloat(threshInput.approve)
+    const block   = parseFloat(threshInput.block)
+    if (isNaN(approve) || isNaN(block) || block < 0 || approve > 1 || block >= approve) {
+      showToast('Require 0 ≤ block < approve ≤ 1 (e.g. 0.60 / 0.90).', 'error'); return
+    }
+    setSavingThresh(true)
+    try {
+      const res = await fetch('/api/admin/capture-thresholds', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ approve_threshold: approve, block_threshold: block }),
+      })
+      const data = await res.json()
+      if (res.ok) {
+        showToast(`Thresholds set — approve > ${data.approve_threshold}, block ≤ ${data.block_threshold}`, 'success')
+        setThreshInput({ approve:'', block:'' })
+        fetchCaptureThresholds()
+      } else {
+        showToast(data.message || 'Failed to update thresholds.', 'error')
+      }
+    } catch {
+      showToast('Connection error.', 'error')
+    } finally {
+      setSavingThresh(false)
+    }
   }
 
   async function saveBudget() {
@@ -407,6 +448,60 @@ export default function AdminDashboard({ user, setUser }) {
               )}
             </div>
           </div>
+
+          {/* ── Vision-match sensitivity thresholds (per store, tunable) ── */}
+          {thresholds && (
+            <div style={{ background:'rgba(8,3,18,.88)', border:'1px solid rgba(109,40,217,.22)', borderRadius:18, overflow:'hidden', marginBottom:20, animation:'cardIn .6s .3s cubic-bezier(.22,1,.36,1) both' }}>
+              <div style={{ padding:'14px 22px', borderBottom:'1px solid rgba(109,40,217,.15)', background:'rgba(0,0,0,.3)', display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
+                <span style={{ fontSize:15 }}>🎚️</span>
+                <span style={{ fontSize:13, fontWeight:700, color:'#e9d5ff' }}>Vision Match Sensitivity</span>
+                <span style={{ fontSize:10, color:'#64748b', fontFamily:'monospace' }}>capture ↔ reference decision thresholds</span>
+              </div>
+              <div style={{ padding:'16px 22px' }}>
+                {/* current bands */}
+                <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:10, marginBottom:16 }}>
+                  {[
+                    ['Auto-approve', `> ${thresholds.approve_threshold}`, '#86efac'],
+                    ['Manager review', `${thresholds.block_threshold} – ${thresholds.approve_threshold}`, '#fcd34d'],
+                    ['Auto-block', `≤ ${thresholds.block_threshold}`, '#fca5a5'],
+                  ].map(([label,band,c],i)=>(
+                    <div key={i} style={{ padding:'10px 12px', borderRadius:10, background:`${c}12`, border:`1px solid ${c}33` }}>
+                      <div style={{ fontFamily:'monospace', fontSize:9, letterSpacing:'.8px', textTransform:'uppercase', color:'#64748b', marginBottom:4 }}>{label}</div>
+                      <div style={{ fontFamily:'monospace', fontSize:14, fontWeight:700, color:c }}>{band}</div>
+                    </div>
+                  ))}
+                </div>
+                {/* editor */}
+                <div style={{ display:'flex', alignItems:'flex-end', gap:12, flexWrap:'wrap' }}>
+                  <div>
+                    <div style={{ fontFamily:'monospace', fontSize:9, letterSpacing:'1px', textTransform:'uppercase', color:'#4c1d95', marginBottom:4 }}>Approve &gt;</div>
+                    <input type="number" min="0" max="1" step="0.01"
+                      value={threshInput.approve}
+                      onChange={e => setThreshInput(t => ({ ...t, approve: e.target.value }))}
+                      placeholder={String(thresholds.approve_threshold)}
+                      style={{ width:90, padding:'7px 9px', borderRadius:8, border:'1px solid rgba(109,40,217,.3)', background:'rgba(0,0,0,.35)', color:'#86efac', fontFamily:'monospace', fontSize:13, outline:'none' }} />
+                  </div>
+                  <div>
+                    <div style={{ fontFamily:'monospace', fontSize:9, letterSpacing:'1px', textTransform:'uppercase', color:'#4c1d95', marginBottom:4 }}>Block ≤</div>
+                    <input type="number" min="0" max="1" step="0.01"
+                      value={threshInput.block}
+                      onChange={e => setThreshInput(t => ({ ...t, block: e.target.value }))}
+                      placeholder={String(thresholds.block_threshold)}
+                      style={{ width:90, padding:'7px 9px', borderRadius:8, border:'1px solid rgba(109,40,217,.3)', background:'rgba(0,0,0,.35)', color:'#fca5a5', fontFamily:'monospace', fontSize:13, outline:'none' }} />
+                  </div>
+                  <button onClick={saveCaptureThresholds} disabled={savingThresh}
+                    style={{ padding:'8px 16px', borderRadius:8, border:'none', cursor:savingThresh?'not-allowed':'pointer', fontSize:12, fontWeight:700, fontFamily:"'Sora',sans-serif", background:'linear-gradient(135deg,#7c3aed,#5b21b6)', color:'#fff', opacity:savingThresh?.5:1 }}>
+                    {savingThresh ? 'Saving…' : 'Update'}
+                  </button>
+                  {thresholds.defaults && (
+                    <span style={{ fontFamily:'monospace', fontSize:10, color:'#4c1d95', marginLeft:'auto' }}>
+                      defaults {thresholds.defaults.approve} / {thresholds.defaults.block}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Active sessions list */}
           <div style={{ background:'rgba(8,3,18,.88)', border:'1px solid rgba(109,40,217,.22)', borderRadius:18, overflow:'hidden', animation:'cardIn .6s .3s cubic-bezier(.22,1,.36,1) both' }}>

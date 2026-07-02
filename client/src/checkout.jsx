@@ -74,6 +74,12 @@ export default function CheckoutPage({ user, setUser }) {
             ? { ...v, ai_explanation: msg.explanation, ai_explanation_source: msg.source }
             : v)
         }
+        // Vision-layer decision for the just-captured scan.
+        if (msg.type === 'CAPTURE_DECISION') {
+          setCaptureStatus(s => (s && (s.txnRef === msg.txn_ref || !s.txnRef))
+            ? { ...s, decision: msg.decision, confidence: msg.confidence }
+            : { txnRef: msg.txn_ref, state: 'stored', decision: msg.decision, confidence: msg.confidence })
+        }
       } catch {}
     }
     ws.onerror = () => {}
@@ -469,6 +475,24 @@ export default function CheckoutPage({ user, setUser }) {
                       {(captureStatus.state==='skipped' || captureStatus.state==='error') && (
                         <div style={{marginTop:6,fontFamily:'monospace',fontSize:11,color:'#fcd34d'}}>{captureStatus.reason}</div>
                       )}
+                      {/* Vision-match decision (from the threshold branching) */}
+                      {captureStatus.decision && (() => {
+                        const dmap = {
+                          auto_approve:   ['✅ AUTO-APPROVED','#86efac','rgba(134,239,172,.1)','rgba(134,239,172,.3)'],
+                          manager_review: ['🔶 MANAGER REVIEW','#fcd34d','rgba(252,211,77,.1)','rgba(252,211,77,.3)'],
+                          auto_block:     ['⛔ AUTO-BLOCKED','#fca5a5','rgba(252,165,165,.1)','rgba(252,165,165,.35)'],
+                        }
+                        const [label,c,bg,bd] = dmap[captureStatus.decision] || ['—','#94a3b8','rgba(148,163,184,.1)','rgba(148,163,184,.3)']
+                        return (
+                          <div style={{marginTop:10,paddingTop:10,borderTop:'1px solid rgba(109,40,217,.12)',display:'flex',alignItems:'center',gap:8}}>
+                            <span style={{fontFamily:'monospace',fontSize:9,color:'#4c1d95',letterSpacing:'1px',textTransform:'uppercase'}}>Vision decision</span>
+                            <span style={{marginLeft:'auto',padding:'3px 10px',borderRadius:7,fontSize:11,fontWeight:700,fontFamily:'monospace',color:c,background:bg,border:`1px solid ${bd}`}}>{label}</span>
+                            {captureStatus.confidence!=null && (
+                              <span style={{fontFamily:'monospace',fontSize:11,color:'#c4b5fd'}}>{Math.round(captureStatus.confidence*100)}%</span>
+                            )}
+                          </div>
+                        )
+                      })()}
                     </div>
                   )}
 

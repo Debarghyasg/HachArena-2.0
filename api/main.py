@@ -21,6 +21,8 @@ import redis.asyncio as aioredis
 from datetime import datetime
 import re
 import asyncio
+import time
+import math
 
 import injection_model   # local self-hosted LSTM prompt-injection classifier
 import purchase_verifier # anti-fraud: cross-check complaint product vs purchase history
@@ -46,6 +48,15 @@ MODEL_PATH = os.getenv("MODEL_PATH", "./AI_Model/best_final.pt")
 # usually can't recognise — still produce a detection instead of always going to
 # manual review.
 GENERAL_MODEL_PATH = os.getenv("GENERAL_MODEL_PATH", "./AI_Model/yolov8n.pt")
+
+# Root under which local store assets (per-SKU reference images + checkout
+# captures) live. Defaults to the repo root (parent of this api/ dir) so paths
+# written by the Node gateway (store-data/...) resolve regardless of the FastAPI
+# working directory. Both services must agree on this if overridden.
+STORE_DATA_ROOT = os.path.abspath(os.getenv("STORE_DATA_ROOT", os.path.join(os.path.dirname(__file__), "..")))
+# Score at/above which the captured item is considered a confident match to its
+# SKU reference profile image. Below it => routed to manager review.
+CAPTURE_MATCH_THRESHOLD = float(os.getenv("CAPTURE_MATCH_THRESHOLD", "0.55"))
 
 db_pool    = None
 redis_pool = None
@@ -306,6 +317,217 @@ def run_yolo_detailed(img) -> list[dict]:
     if not dets:                       # narrow model saw nothing → try the general one
         dets = _run(general_model, "general")
     return sorted(dets, key=lambda d: d["conf"], reverse=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAPTURE ↔ REFERENCE MATCH — compare the just-captured checkout image against
+# the scanned SKU's stored reference profile image, and score it 0–1 with YOLO.
+# ─────────────────────────────────────────────────────────────────────────────
+def _resolve_store_path(p: str):
+    """Resolve a (possibly repo-relative) store-data path to an absolute path,
+    rejecting anything that escapes STORE_DATA_ROOT (path-traversal safe)."""
+    if not p:
+        return None
+    cand = p if os.path.isabs(p) else os.path.join(STORE_DATA_ROOT, p)
+    cand = os.path.abspath(cand)
+    try:
+        if os.path.commonpath([cand, STORE_DATA_ROOT]) != STORE_DATA_ROOT:
+            return None
+    except ValueError:
+        return None
+    return cand
+
+
+def load_capture_and_reference(
+    checkout_image_path: "Optional[str]" = None,
+    reference_image_path: "Optional[str]" = None,
+    checkout_image_b64: "Optional[str]" = None,
+    reference_image_b64: "Optional[str]" = None,
+) -> dict:
+    """Load the just-captured checkout image AND the stored reference image for
+    the scanned SKU into OpenCV arrays.
+
+    Prefers local file paths (both images already live on the local server, so
+    there's no need to ship bytes over the wire); falls back to inline base64 if
+    a path is missing/unreadable. Returns
+        {checkout_img, reference_img, src: {checkout, reference}}
+    with None for any image that couldn't be loaded.
+    """
+    checkout_img = reference_img = None
+    src = {"checkout": None, "reference": None}
+
+    if checkout_image_path:
+        cp = _resolve_store_path(checkout_image_path)
+        if cp and os.path.exists(cp):
+            checkout_img = cv2.imread(cp)
+            src["checkout"] = cp
+    if checkout_img is None and checkout_image_b64:
+        checkout_img = _decode_image(checkout_image_b64)
+        src["checkout"] = "b64"
+
+    if reference_image_path:
+        rp = _resolve_store_path(reference_image_path)
+        if rp and os.path.exists(rp):
+            reference_img = cv2.imread(rp)
+            src["reference"] = rp
+    if reference_img is None and reference_image_b64:
+        reference_img = _decode_image(reference_image_b64)
+        src["reference"] = "b64"
+
+    return {"checkout_img": checkout_img, "reference_img": reference_img, "src": src}
+
+
+def score_capture_match(checkout_img, reference_img) -> dict:
+    """Run YOLO on the captured image and the SKU reference image and return a
+    0–1 confidence that they are the SAME product.
+
+    Score = label_similarity × geometric-mean(detection confidences). Identical
+    top-labels detected strongly ⇒ high confidence; differing labels (a swapped/
+    wrong item) ⇒ low. Returns confidence=None ("inconclusive") when either image
+    yields no detection, so an unreadable frame is never scored as a mismatch.
+    Model-version agnostic — runs whatever weights are loaded (YOLOv8/v10/…).
+    """
+    ck = run_yolo_detailed(checkout_img)
+    rf = run_yolo_detailed(reference_img)
+    ck_top = ck[0] if ck else None
+    rf_top = rf[0] if rf else None
+
+    if not ck_top or not rf_top:
+        missing = []
+        if not ck_top: missing.append("checkout")
+        if not rf_top: missing.append("reference")
+        return {
+            "confidence": None,
+            "match": None,
+            "reason": "no_detection:" + ",".join(missing),
+            "checkout_label": ck_top["label"] if ck_top else None,
+            "reference_label": rf_top["label"] if rf_top else None,
+            "model_available": False,
+        }
+
+    label_sim = max(
+        fuzz.ratio(ck_top["label"].lower(), rf_top["label"].lower()),
+        fuzz.token_set_ratio(ck_top["label"].lower(), rf_top["label"].lower()),
+    ) / 100.0
+    det_geo = math.sqrt(max(0.0, ck_top["conf"]) * max(0.0, rf_top["conf"]))
+    confidence = round(label_sim * det_geo, 3)
+
+    return {
+        "confidence": confidence,
+        "match": bool(confidence >= CAPTURE_MATCH_THRESHOLD),
+        "checkout_label": ck_top["label"],
+        "checkout_conf": round(ck_top["conf"], 3),
+        "reference_label": rf_top["label"],
+        "reference_conf": round(rf_top["conf"], 3),
+        "label_similarity": round(label_sim, 3),
+        "threshold": CAPTURE_MATCH_THRESHOLD,
+        "model_available": True,
+    }
+
+
+async def _persist_capture_score(shop_id, barcode, txn_ref, score):
+    """Store the capture-match score against the most recent transaction row for
+    this shop+barcode (audit trail + manager-review path). Fails soft if the
+    migration hasn't been run."""
+    if db_pool is None or shop_id is None or not barcode or score is None:
+        return False
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE transactions
+                      SET capture_match_score = $1,
+                          capture_ref         = $2,
+                          capture_match_at    = NOW()
+                    WHERE id = (SELECT id FROM transactions
+                                 WHERE shop_id = $3 AND barcode = $4
+                                 ORDER BY scanned_at DESC
+                                 LIMIT 1)""",
+                float(score), txn_ref, int(shop_id), str(barcode),
+            )
+        return True
+    except Exception as e:
+        print(f"capture score persist skipped (run migration_capture_match.sql): {e}")
+        return False
+
+
+class CaptureMatchRequest(BaseModel):
+    """Compare a just-captured checkout image against a SKU's reference image."""
+    checkout_image_path:  Optional[str] = None
+    reference_image_path: Optional[str] = None
+    checkout_image_b64:   Optional[str] = None
+    reference_image_b64:  Optional[str] = None
+    txn_ref:              Optional[str] = None   # capture ref (CAP-…) for audit linkage
+    transaction_id:       Optional[str] = None   # alias for txn_ref
+    shop_id:              Optional[int] = None
+    barcode:              Optional[str] = None
+
+
+@app.post("/audit/capture-match")
+async def capture_match(req: CaptureMatchRequest):
+    """Load the captured checkout image + the SKU reference image, score them
+    0–1 with YOLO, and persist the score to the transaction record. Inference
+    runs off the event loop so it never blocks other requests."""
+    t0 = time.perf_counter()
+    loaded = await asyncio.to_thread(
+        load_capture_and_reference,
+        req.checkout_image_path, req.reference_image_path,
+        req.checkout_image_b64, req.reference_image_b64,
+    )
+    ck, rf = loaded["checkout_img"], loaded["reference_img"]
+    if ck is None or rf is None:
+        return {
+            "ok": False,
+            "confidence": None,
+            "reason": "checkout_image_unavailable" if ck is None else "reference_image_unavailable",
+            "src": loaded["src"],
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+
+    result = await asyncio.to_thread(score_capture_match, ck, rf)
+    result["ok"] = True
+    result["model"] = MODEL_PATH
+    result["latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+
+    txn_ref = req.txn_ref or req.transaction_id
+    result["persisted"] = await _persist_capture_score(req.shop_id, req.barcode, txn_ref, result.get("confidence"))
+    return result
+
+
+@app.get("/audit/capture-match/benchmark")
+async def capture_match_benchmark(n: int = 20, size: int = 640):
+    """Benchmark end-to-end match latency on THIS server's hardware. Each run
+    scores two images (checkout + reference), exactly as production does. Use
+    this to confirm the model is fast enough to not add checkout lag."""
+    if yolo_model is None and general_model is None:
+        return {"ok": False, "reason": "no_model_loaded"}
+    n = max(1, min(200, n))
+    size = max(64, min(1920, size))
+    img = np.random.randint(0, 255, (size, size, 3), dtype=np.uint8)
+
+    await asyncio.to_thread(score_capture_match, img, img)   # warm the path
+
+    lat = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        await asyncio.to_thread(score_capture_match, img, img)
+        lat.append((time.perf_counter() - t0) * 1000)
+    lat.sort()
+
+    def _pct(p):
+        return round(lat[min(len(lat) - 1, int(math.ceil(p / 100 * len(lat))) - 1)], 1)
+
+    return {
+        "ok": True,
+        "n": n,
+        "image_size": size,
+        "mean_ms": round(sum(lat) / len(lat), 1),
+        "p50_ms": _pct(50),
+        "p95_ms": _pct(95),
+        "min_ms": round(lat[0], 1),
+        "max_ms": round(lat[-1], 1),
+        "model": MODEL_PATH,
+        "note": "Each iteration runs YOLO on TWO images (checkout + reference), as in production.",
+    }
 
 
 # Threshold above which the product/label is considered cleanly "intact" in

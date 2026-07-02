@@ -1056,7 +1056,7 @@ function writeCaptureLocally(shopId, txnRef, imageB64) {
         try { fs.unlinkSync(abs); } catch {}
         throw new Error('checksum mismatch after write');
     }
-    return { path: `store-data/checkout-captures/${shopId}/${txnRef}.jpg`, checksum: actual, bytes: buf.length };
+    return { path: `store-data/checkout-captures/${shopId}/${txnRef}.jpg`, abs, checksum: actual, bytes: buf.length };
 }
 
 // Called on gate-pass: create the transaction-scoped capture state in Redis and
@@ -1083,6 +1083,69 @@ async function issueCaptureAuthorization(shop, barcode, mkId, verifyResult) {
         capture_token:      signCaptureToken({ txn_ref: txnRef, shop_id: shop.id, barcode, exp }),
         capture_expires_in: CAPTURE_TOKEN_TTL_S,
     };
+}
+
+// Merge a match result into the transaction-scoped capture state in Redis
+// (preserving the remaining TTL). This is the audit trail for the score.
+async function updateCaptureMatch(txnRef, match) {
+    try {
+        const raw = await redisClient.get(captureStateKey(txnRef));
+        if (!raw) return;
+        const state = JSON.parse(raw);
+        state.match = match;
+        const ttl = await redisClient.ttl(captureStateKey(txnRef));
+        await redisClient.set(captureStateKey(txnRef), JSON.stringify(state), { EX: ttl > 0 ? ttl : CAPTURE_STATE_TTL_S });
+    } catch (e) { console.warn('capture match state update failed (non-fatal):', e.message); }
+}
+
+// Compare the just-captured checkout image against the scanned SKU's reference
+// profile image (YOLO, in FastAPI) and record the 0–1 score. Run FIRE-AND-FORGET
+// off the checkout critical path so it can never add scan/checkout latency; the
+// score lands on the transaction record + Redis state a moment later for the
+// audit trail and manager-review path.
+async function scoreCaptureMatch(shopId, txnRef, state, ref) {
+    const barcode = state && state.barcode;
+    if (!barcode) return;
+
+    // Resolve the SKU's reference image: DB-linked path first, else convention.
+    let refAbs = referenceImageAbsPath(shopId, barcode);
+    try {
+        const q = await db.query('SELECT reference_image_path FROM products WHERE barcode = $1 AND shop_id = $2', [barcode, shopId]);
+        const linked = q.rows[0] && q.rows[0].reference_image_path;
+        if (linked) refAbs = path.isAbsolute(linked) ? linked : path.join(__dirname, linked);
+    } catch { /* fall back to convention path */ }
+
+    if (!fs.existsSync(refAbs)) {
+        await updateCaptureMatch(txnRef, { scored: false, reason: 'no_reference_image', at: new Date().toISOString() });
+        return;
+    }
+
+    const checkoutAbs = (ref && ref.abs) || path.join(__dirname, ref.path);
+    try {
+        const r = await axios.post(`${FASTAPI_URL}/audit/capture-match`, {
+            checkout_image_path:  checkoutAbs,
+            reference_image_path: refAbs,
+            txn_ref:              txnRef,
+            shop_id:              shopId,
+            barcode,
+        }, { timeout: 20000 });
+        const d = r.data || {};
+        await updateCaptureMatch(txnRef, {
+            scored:          d.confidence != null,
+            confidence:      d.confidence ?? null,
+            match:           d.match ?? null,
+            checkout_label:  d.checkout_label ?? null,
+            reference_label: d.reference_label ?? null,
+            latency_ms:      d.latency_ms ?? null,
+            model:           d.model ?? null,
+            persisted:       d.persisted ?? false,
+            reason:          d.reason ?? null,
+            at:              new Date().toISOString(),
+        });
+        console.log(`🔎 Capture match ${txnRef}: confidence=${d.confidence}, match=${d.match} (${d.latency_ms}ms)`);
+    } catch (e) {
+        await updateCaptureMatch(txnRef, { scored: false, reason: 'match_service_error: ' + e.message, at: new Date().toISOString() });
+    }
 }
 
 // ── CHECKOUT ──────────────────────────────────────────────────────────────────
@@ -1329,7 +1392,14 @@ app.post('/api/checkout/capture', isAuth, async (req, res) => {
     } catch (e) { console.warn('capture state update failed (non-fatal):', e.message); }
 
     console.log(`📸 Checkout capture stored — shop ${shop.id}, txn ${payload.txn_ref}, ${ref.bytes}B, sha256 ${ref.checksum.slice(0, 12)}…`);
-    return res.json({ ok: true, txn_ref: payload.txn_ref, image_ref: state.image });
+    res.json({ ok: true, txn_ref: payload.txn_ref, image_ref: state.image });
+
+    // Fire-and-forget: score the capture against the SKU reference image AFTER
+    // responding, so the YOLO comparison is off the checkout critical path and
+    // adds no lag. The 0–1 score is persisted to the transaction + Redis state.
+    scoreCaptureMatch(shop.id, payload.txn_ref, state, ref)
+        .catch(e => console.warn('capture match dispatch failed (non-fatal):', e.message));
+    return;
 });
 
 // GET /api/checkout/capture/:txnRef — read the transaction-scoped capture state
